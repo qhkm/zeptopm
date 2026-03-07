@@ -11,6 +11,7 @@ use crate::agent::{
   push_log, spawn_agent, AgentHandle, AgentState, AgentStateUpdate, AgentStatus,
 };
 use crate::config::{self, Config};
+use crate::orchestrator::engine::OrchestratorEngine;
 use crate::server::{self, DaemonCommand, ManagedAgentRef, ResolvedGatewayConfig, SharedState};
 
 /// Run the daemon. This is the main entry point.
@@ -47,6 +48,9 @@ pub async fn run(config_path: String, bind: Option<String>) {
 
   // Track internal daemon state (owns JoinHandles, restart config)
   let mut managed: HashMap<String, InternalAgent> = HashMap::new();
+
+  // Initialize orchestrator
+  let mut orchestrator = OrchestratorEngine::new(4);
 
   // Spawn auto_start agents
   for agent_config in &config.agents {
@@ -214,6 +218,11 @@ pub async fn run(config_path: String, bind: Option<String>) {
                 let _ = reply.send(Err(format!("agent '{}' not found in config", name)));
               }
             }
+          }
+          DaemonCommand::SubmitRun { task, reply } => {
+            let run_id = orchestrator.submit_run(task);
+            info!(run_id = %run_id, "new orchestrated run submitted");
+            let _ = reply.send(Ok(run_id));
           }
         }
       }

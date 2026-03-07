@@ -75,6 +75,11 @@ enum Commands {
     /// Task for the manager
     message: String,
   },
+  /// Submit and manage orchestrated multi-agent runs
+  Run {
+    #[command(subcommand)]
+    action: RunAction,
+  },
   /// Internal: run a single agent as a worker process
   #[command(hide = true)]
   Worker {
@@ -85,6 +90,22 @@ enum Commands {
     #[arg(long)]
     config: String,
   },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum RunAction {
+  /// Submit a new orchestrated run
+  Submit {
+    /// Task description
+    task: String,
+  },
+  /// Check status of a run
+  Status {
+    /// Run ID
+    run_id: String,
+  },
+  /// List all runs
+  List,
 }
 
 fn init_tracing(level: &str, format: &str) {
@@ -351,6 +372,51 @@ async fn main() {
           eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
           eprintln!("Is the daemon running? Start with: zeptopm daemon");
           std::process::exit(1);
+        }
+      }
+    }
+    Some(Commands::Run { action }) => {
+      match action {
+        RunAction::Submit { task } => {
+          let body = serde_json::json!({ "task": task });
+          match http_post(&cli.addr, "/runs", &body).await {
+            Ok(resp_body) => {
+              let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+              if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+                eprintln!("Error: {}", error);
+                std::process::exit(1);
+              }
+              if let Some(run_id) = resp.get("run_id").and_then(|v| v.as_str()) {
+                println!("Run submitted: {}", run_id);
+              }
+            }
+            Err(e) => {
+              eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+              std::process::exit(1);
+            }
+          }
+        }
+        RunAction::Status { run_id } => {
+          match http_get(&cli.addr, &format!("/runs/{}", run_id)).await {
+            Ok(resp_body) => {
+              println!("{}", resp_body);
+            }
+            Err(e) => {
+              eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+              std::process::exit(1);
+            }
+          }
+        }
+        RunAction::List => {
+          match http_get(&cli.addr, "/runs").await {
+            Ok(resp_body) => {
+              println!("{}", resp_body);
+            }
+            Err(e) => {
+              eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+              std::process::exit(1);
+            }
+          }
         }
       }
     }

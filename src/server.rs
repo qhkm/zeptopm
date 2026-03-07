@@ -28,6 +28,11 @@ pub enum DaemonCommand {
     name: String,
     reply: tokio::sync::oneshot::Sender<Result<String, String>>,
   },
+  /// Submit a multi-step orchestrated run.
+  SubmitRun {
+    task: String,
+    reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+  },
 }
 
 /// Shared daemon state exposed to HTTP handlers.
@@ -146,6 +151,16 @@ struct OkResponse {
   status: String,
 }
 
+#[derive(Deserialize)]
+struct RunSubmitRequest {
+  task: String,
+}
+
+#[derive(Serialize)]
+struct RunSubmitResponse {
+  run_id: String,
+}
+
 fn agent_to_info(name: &str, state: &AgentState) -> AgentInfo {
   AgentInfo {
     name: name.to_string(),
@@ -172,6 +187,7 @@ pub fn build_router(state: SharedState) -> Router {
     .route("/orchestrate/{name}", post(post_orchestrate))
     .route("/gw/{name}/chat", post(gateway_chat))
     .route("/health", get(get_health))
+    .route("/runs", post(post_run_submit))
     .with_state(state)
 }
 
@@ -513,6 +529,25 @@ async fn post_orchestrate(
     delegations: all_delegations,
     rounds,
   }))
+}
+
+async fn post_run_submit(
+  State(state): State<SharedState>,
+  Json(body): Json<RunSubmitRequest>,
+) -> Result<Json<RunSubmitResponse>, (StatusCode, Json<ErrorResponse>)> {
+  let daemon_tx = { state.read().await.daemon_tx.clone() };
+  let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+  daemon_tx
+    .send(DaemonCommand::SubmitRun { task: body.task, reply: reply_tx })
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR,
+      Json(ErrorResponse { error: "daemon channel closed".into() })))?;
+  match reply_rx.await {
+    Ok(Ok(run_id)) => Ok(Json(RunSubmitResponse { run_id })),
+    Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e }))),
+    Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR,
+      Json(ErrorResponse { error: "daemon did not reply".into() }))),
+  }
 }
 
 // --- Health endpoint (for external gateways / load balancers) ---

@@ -349,6 +349,20 @@ async fn worker_bridge(
                   })
                   .await;
               }
+              "artifact_produced" | "job_completed" | "job_failed" => {
+                let _ = state_tx
+                  .send(AgentStateUpdate {
+                    name: agent_name.clone(),
+                    status: AgentStatus::Idle,
+                    error: None,
+                    tokens_delta: 0,
+                    log: Some(make_log("info", &format!("{}: {}",
+                      msg_type,
+                      msg.get("job_id").and_then(|v| v.as_str()).unwrap_or("?")))),
+                    pid: child_pid,
+                  })
+                  .await;
+              }
               _ => {
                 debug!(agent = %agent_name, msg_type = msg_type, "unknown worker message type");
               }

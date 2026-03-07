@@ -138,6 +138,65 @@ pub async fn run(agent_name: String, config_path: String) {
 
         send_status("idle", None);
       }
+      Some("job_execute") => {
+        let job_id = cmd.get("job_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let instruction = cmd.get("instruction").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let workspace = cmd.get("workspace").and_then(|v| v.as_str()).unwrap_or("/tmp").to_string();
+        let input_artifacts: Vec<String> = cmd.get("input_artifacts")
+          .and_then(|v| v.as_array())
+          .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+          .unwrap_or_default();
+
+        send_status("running", None);
+        send_log("info", &format!("executing job {}", job_id));
+
+        // Build context from input artifacts
+        let mut context = instruction.clone();
+        for artifact_path in &input_artifacts {
+          if let Ok(content) = std::fs::read_to_string(artifact_path) {
+            context.push_str(&format!("\n\n--- Input from previous step ---\n{}", content));
+          }
+        }
+
+        // Create workspace directory
+        std::fs::create_dir_all(&workspace).ok();
+
+        match agent.chat(&context).await {
+          Ok(response) => {
+            // Write output artifact
+            let artifact_path = format!("{}/output.md", workspace);
+            std::fs::write(&artifact_path, &response).ok();
+            let artifact_id = format!("art_{}", job_id);
+
+            send(&serde_json::json!({
+              "type": "artifact_produced",
+              "job_id": job_id,
+              "artifact_id": artifact_id,
+              "kind": "markdown",
+              "path": artifact_path,
+              "summary": response.chars().take(200).collect::<String>()
+            }));
+
+            send(&serde_json::json!({
+              "type": "job_completed",
+              "job_id": job_id,
+              "output_artifact_ids": [artifact_id]
+            }));
+            send_log("info", &format!("job {} completed", job_id));
+          }
+          Err(e) => {
+            send(&serde_json::json!({
+              "type": "job_failed",
+              "job_id": job_id,
+              "error": e.to_string(),
+              "retryable": true
+            }));
+            send_log("error", &format!("job {} failed: {}", job_id, e));
+          }
+        }
+
+        send_status("idle", None);
+      }
       Some("stop") => {
         // Save history before stopping (truncated if max_history set)
         if let Some(ref path) = session_file {
