@@ -5,3 +5,4 @@ pub mod provider;
 pub mod server;
 pub mod status;
 pub mod worker;
+pub mod orchestrator;
