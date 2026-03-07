@@ -111,6 +111,7 @@ pub fn build_router(state: SharedState) -> Router {
     .route("/agents/{name}/restart", post(post_restart))
     .route("/agents/{name}/status", get(get_agent_status))
     .route("/agents/{name}/logs", get(get_agent_logs))
+    .route("/orchestrate/{name}", post(post_orchestrate))
     .with_state(state)
 }
 
@@ -320,6 +321,138 @@ async fn post_restart(
       }),
     )),
   }
+}
+
+#[derive(Deserialize)]
+struct OrchestrateRequest {
+  message: String,
+  #[serde(default = "default_max_rounds")]
+  max_rounds: usize,
+}
+
+fn default_max_rounds() -> usize {
+  5
+}
+
+#[derive(Serialize)]
+struct OrchestrateResponse {
+  agent: String,
+  response: String,
+  delegations: Vec<DelegationResult>,
+  rounds: usize,
+}
+
+#[derive(Serialize, Clone)]
+struct DelegationResult {
+  to: String,
+  query: String,
+  result: String,
+}
+
+/// Parse `@delegate(agent_name): message` markers from LLM response.
+fn parse_delegations(text: &str) -> Vec<(String, String)> {
+  let mut delegations = Vec::new();
+  for line in text.lines() {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("@delegate(") {
+      if let Some(paren_end) = rest.find(')') {
+        let agent_name = &rest[..paren_end];
+        let message = rest[paren_end + 1..].trim_start_matches(':').trim();
+        if !agent_name.is_empty() && !message.is_empty() {
+          delegations.push((agent_name.to_string(), message.to_string()));
+        }
+      }
+    }
+  }
+  delegations
+}
+
+async fn post_orchestrate(
+  State(state): State<SharedState>,
+  Path(name): Path<String>,
+  Json(body): Json<OrchestrateRequest>,
+) -> Result<Json<OrchestrateResponse>, (StatusCode, Json<ErrorResponse>)> {
+  let max_rounds = body.max_rounds.min(10);
+  let mut all_delegations: Vec<DelegationResult> = Vec::new();
+  let mut current_message = body.message;
+  let mut rounds = 0;
+  let final_response;
+
+  loop {
+    rounds += 1;
+
+    // Send to manager
+    let manager_handle = {
+      let s = state.read().await;
+      s.agents.get(&name).map(|m| m.handle.clone())
+    }
+    .ok_or_else(|| {
+      (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+          error: format!("agent '{}' not found", name),
+        }),
+      )
+    })?;
+
+    let response = manager_handle.chat(current_message).await.map_err(|e| {
+      (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse { error: e }),
+      )
+    })?;
+
+    let delegations = parse_delegations(&response);
+
+    if delegations.is_empty() || rounds > max_rounds {
+      final_response = response;
+      break;
+    }
+
+    // Execute delegations
+    let mut results = Vec::new();
+    for (target_name, target_msg) in &delegations {
+      let target_handle = {
+        let s = state.read().await;
+        s.agents.get(target_name).map(|m| m.handle.clone())
+      };
+
+      match target_handle {
+        Some(handle) => match handle.chat(target_msg.clone()).await {
+          Ok(result) => {
+            all_delegations.push(DelegationResult {
+              to: target_name.clone(),
+              query: target_msg.clone(),
+              result: result.clone(),
+            });
+            results.push(format!("From @{}:\n{}", target_name, result));
+          }
+          Err(e) => {
+            results.push(format!("From @{}: [error: {}]", target_name, e));
+          }
+        },
+        None => {
+          results.push(format!(
+            "From @{}: [agent not found or not running]",
+            target_name
+          ));
+        }
+      }
+    }
+
+    // Feed results back to manager
+    current_message = format!(
+      "Here are the results from the agents you delegated to:\n\n{}\n\nNow provide your final answer incorporating these results. If you need more info, delegate again.",
+      results.join("\n\n")
+    );
+  }
+
+  Ok(Json(OrchestrateResponse {
+    agent: name,
+    response: final_response,
+    delegations: all_delegations,
+    rounds,
+  }))
 }
 
 /// Start the HTTP server on the given bind address.

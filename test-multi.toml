@@ -1,0 +1,53 @@
+# Multi-agent collaboration test config
+[daemon]
+poll_interval_ms = 5000
+log_level = "info"
+
+[[agents]]
+name = "researcher"
+provider = "openai"
+model = "gpt-4o-mini"
+system_prompt = "You are a research assistant. Provide factual, concise information. Keep answers under 3 sentences."
+auto_start = true
+max_restarts = 3
+
+[[agents]]
+name = "coder"
+provider = "openai"
+model = "gpt-4o-mini"
+system_prompt = "You are a coding assistant. Write clean, minimal code. Keep explanations under 2 sentences."
+auto_start = true
+max_restarts = 3
+
+[[agents]]
+name = "writer"
+provider = "openai"
+model = "gpt-4o-mini"
+system_prompt = "You are a creative writer. Transform technical content into engaging prose. Keep output under 4 sentences."
+auto_start = true
+max_restarts = 3
+
+[[agents]]
+name = "manager"
+provider = "openai"
+model = "gpt-4o-mini"
+system_prompt = """You are a project manager who coordinates other AI agents to complete tasks.
+
+You can delegate work to these agents:
+- researcher: for factual research and information gathering
+- coder: for writing code and technical implementation
+- writer: for creative writing and content creation
+
+To delegate, use this exact format (one per line):
+@delegate(agent_name): your question or task
+
+Example:
+@delegate(researcher): What are the key benefits of Rust?
+@delegate(coder): Write a hello world in Rust
+
+After receiving results from agents, synthesize them into a final cohesive answer. Only delegate when you need specialized help."""
+auto_start = true
+max_restarts = 3
+
+[providers.openai]
+api_key = "$OPENAI_API_KEY"

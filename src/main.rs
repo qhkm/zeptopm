@@ -61,6 +61,20 @@ enum Commands {
     /// Agent name
     name: String,
   },
+  /// Chain agents in a pipeline (output of one feeds into the next)
+  Pipeline {
+    /// Comma-separated agent names (e.g. "researcher,writer")
+    agents: String,
+    /// Message to start the pipeline
+    message: String,
+  },
+  /// Orchestrate multi-agent collaboration (manager delegates to other agents)
+  Orchestrate {
+    /// Manager agent name (coordinates the work)
+    manager: String,
+    /// Task for the manager
+    message: String,
+  },
 }
 
 fn init_tracing(level: &str, format: &str) {
@@ -251,6 +265,81 @@ async fn main() {
         }
         Err(e) => {
           eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+          std::process::exit(1);
+        }
+      }
+    }
+    Some(Commands::Pipeline { agents, message }) => {
+      let agent_names: Vec<&str> = agents.split(',').map(|s| s.trim()).collect();
+      if agent_names.is_empty() {
+        eprintln!("No agents specified");
+        std::process::exit(1);
+      }
+
+      let mut current_message = message.clone();
+      for (i, agent_name) in agent_names.iter().enumerate() {
+        println!("--- [{}] {} ---", i + 1, agent_name);
+        let body = serde_json::json!({ "message": current_message });
+        match http_post(&cli.addr, &format!("/agents/{}/chat", agent_name), &body).await {
+          Ok(resp_body) => {
+            let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+            if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+              eprintln!("Error from {}: {}", agent_name, error);
+              std::process::exit(1);
+            }
+            if let Some(content) = resp.get("response").and_then(|v| v.as_str()) {
+              println!("{}", content);
+              if i < agent_names.len() - 1 {
+                current_message = format!(
+                  "Previous step (from {}): {}\n\nContinue with the original task: {}",
+                  agent_name, content, message
+                );
+              }
+            }
+          }
+          Err(e) => {
+            eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+            std::process::exit(1);
+          }
+        }
+        println!();
+      }
+    }
+    Some(Commands::Orchestrate { manager, message }) => {
+      let body = serde_json::json!({ "message": message });
+      match http_post(&cli.addr, &format!("/orchestrate/{}", manager), &body).await {
+        Ok(resp_body) => {
+          let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+          if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+            eprintln!("Error: {}", error);
+            std::process::exit(1);
+          }
+          if let Some(delegations) = resp.get("delegations").and_then(|v| v.as_array()) {
+            if !delegations.is_empty() {
+              println!("--- delegations ---");
+              for d in delegations {
+                let to = d.get("to").and_then(|v| v.as_str()).unwrap_or("?");
+                let query = d.get("query").and_then(|v| v.as_str()).unwrap_or("?");
+                let result = d.get("result").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("  -> @{}: {}", to, query);
+                println!("  <- {}", result);
+                println!();
+              }
+              println!("--- final response ---");
+            }
+          }
+          if let Some(response) = resp.get("response").and_then(|v| v.as_str()) {
+            println!("{}", response);
+          }
+          if let Some(rounds) = resp.get("rounds").and_then(|v| v.as_u64()) {
+            if rounds > 1 {
+              eprintln!("\n({} rounds)", rounds);
+            }
+          }
+        }
+        Err(e) => {
+          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+          eprintln!("Is the daemon running? Start with: zeptopm daemon");
           std::process::exit(1);
         }
       }
