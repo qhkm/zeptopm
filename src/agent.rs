@@ -46,7 +46,8 @@ impl std::fmt::Display for AgentStatus {
 #[derive(Debug)]
 pub enum AgentCommand {
   /// Send a user message to the agent for LLM processing.
-  UserMessage(String),
+  /// The optional sender receives the LLM response content.
+  UserMessage(String, Option<tokio::sync::oneshot::Sender<Result<String, String>>>),
   /// Stop the agent gracefully.
   Stop,
 }
@@ -59,12 +60,24 @@ pub struct AgentHandle {
 }
 
 impl AgentHandle {
-  /// Send a user message to the agent.
+  /// Send a user message to the agent (fire-and-forget).
   pub async fn send_message(&self, msg: String) -> Result<(), String> {
     self.cmd_tx
-      .send(AgentCommand::UserMessage(msg))
+      .send(AgentCommand::UserMessage(msg, None))
       .await
       .map_err(|_| format!("agent '{}' channel closed", self.name))
+  }
+
+  /// Send a user message and wait for the LLM response.
+  pub async fn chat(&self, msg: String) -> Result<String, String> {
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    self.cmd_tx
+      .send(AgentCommand::UserMessage(msg, Some(resp_tx)))
+      .await
+      .map_err(|_| format!("agent '{}' channel closed", self.name))?;
+    resp_rx
+      .await
+      .map_err(|_| format!("agent '{}' response channel dropped", self.name))?
   }
 
   /// Stop the agent.
@@ -127,7 +140,7 @@ async fn agent_loop(
 
   loop {
     match cmd_rx.recv().await {
-      Some(AgentCommand::UserMessage(msg)) => {
+      Some(AgentCommand::UserMessage(msg, resp_tx)) => {
         debug!(agent = %name, "processing user message");
 
         let _ = state_tx
@@ -152,6 +165,10 @@ async fn agent_loop(
             );
             debug!(agent = %name, content = %response.content, "response content");
 
+            if let Some(tx) = resp_tx {
+              let _ = tx.send(Ok(response.content.clone()));
+            }
+
             let _ = state_tx
               .send(AgentStateUpdate {
                 name: name.clone(),
@@ -163,6 +180,11 @@ async fn agent_loop(
           }
           Err(e) => {
             warn!(agent = %name, error = %e, "LLM call failed");
+
+            if let Some(tx) = resp_tx {
+              let _ = tx.send(Err(e.to_string()));
+            }
+
             let _ = state_tx
               .send(AgentStateUpdate {
                 name: name.clone(),
@@ -229,6 +251,6 @@ mod tests {
     };
     handle.send_message("hello".into()).await.unwrap();
     let cmd = rx.recv().await.unwrap();
-    assert!(matches!(cmd, AgentCommand::UserMessage(ref s) if s == "hello"));
+    assert!(matches!(cmd, AgentCommand::UserMessage(ref s, _) if s == "hello"));
   }
 }

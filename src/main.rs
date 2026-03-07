@@ -16,6 +16,10 @@ struct Cli {
   /// Override log level (trace|debug|info|warn|error)
   #[arg(short, long, global = true)]
   log_level: Option<String>,
+
+  /// Daemon HTTP address (for CLI commands to connect to)
+  #[arg(long, default_value = "127.0.0.1:9876", global = true)]
+  addr: String,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -26,10 +30,32 @@ enum Commands {
     #[arg(short, long)]
     bind: Option<String>,
   },
-  /// Show status of all agents
+  /// Show status of all running agents (queries daemon)
   Status,
-  /// List configured agents
+  /// List configured agents (from config file, no daemon needed)
   List,
+  /// Send a message to an agent and get the response
+  Chat {
+    /// Agent name
+    name: String,
+    /// Message to send
+    message: String,
+  },
+  /// Stop a running agent
+  Stop {
+    /// Agent name
+    name: String,
+  },
+  /// Start an agent (must be defined in config)
+  Start {
+    /// Agent name
+    name: String,
+  },
+  /// Restart an agent (stop + start)
+  Restart {
+    /// Agent name
+    name: String,
+  },
 }
 
 fn init_tracing(level: &str, format: &str) {
@@ -78,26 +104,41 @@ async fn main() {
       zeptopm::daemon::run(cli.config, bind).await;
     }
     Some(Commands::Status) => {
-      let config = match zeptopm::config::load_config(&cli.config) {
-        Ok(c) => c,
+      match http_get(&cli.addr, "/status").await {
+        Ok(body) => {
+          let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+          if let Some(agents) = resp.get("agents").and_then(|a| a.as_array()) {
+            if agents.is_empty() {
+              println!("No agents running.");
+              return;
+            }
+            println!(
+              "{:<20} {:<15} {:<8} {:<12} {}",
+              "NAME", "STATUS", "RESTARTS", "TOKENS", "UPTIME"
+            );
+            println!("{}", "-".repeat(70));
+            for agent in agents {
+              let name = agent.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+              let status = agent.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+              let restarts = agent.get("restart_count").and_then(|v| v.as_u64()).unwrap_or(0);
+              let tokens = agent.get("tokens_used").and_then(|v| v.as_u64()).unwrap_or(0);
+              let uptime = agent
+                .get("uptime_secs")
+                .and_then(|v| v.as_u64())
+                .map(format_uptime)
+                .unwrap_or_else(|| "-".into());
+              println!(
+                "{:<20} {:<15} {:<8} {:<12} {}",
+                name, status, restarts, tokens, uptime
+              );
+            }
+          }
+        }
         Err(e) => {
-          eprintln!("Failed to load config: {}", e);
+          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+          eprintln!("Is the daemon running? Start with: zeptopm daemon");
           std::process::exit(1);
         }
-      };
-      // Simple status: just list configured agents
-      println!("Configured agents ({}):", config.agents.len());
-      for agent in &config.agents {
-        let auto = if agent.auto_start { "auto" } else { "manual" };
-        let model = agent.model.as_deref().unwrap_or("default");
-        println!(
-          "  {} [{}] provider={} model={} {}",
-          agent.name,
-          auto,
-          agent.provider,
-          model,
-          if agent.auto_start { "" } else { "(not auto-started)" }
-        );
       }
     }
     Some(Commands::List) => {
@@ -109,7 +150,104 @@ async fn main() {
         }
       };
       for agent in &config.agents {
-        println!("{}", agent.name);
+        let auto = if agent.auto_start { "auto" } else { "manual" };
+        let model = agent.model.as_deref().unwrap_or("default");
+        println!(
+          "{:<20} {:<10} provider={:<15} model={}",
+          agent.name, auto, agent.provider, model
+        );
+      }
+    }
+    Some(Commands::Chat { name, message }) => {
+      let body = serde_json::json!({ "message": message });
+      match http_post(&cli.addr, &format!("/agents/{}/chat", name), &body).await {
+        Ok(resp_body) => {
+          let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+          if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+            eprintln!("Error: {}", error);
+            std::process::exit(1);
+          }
+          if let Some(content) = resp.get("response").and_then(|v| v.as_str()) {
+            println!("{}", content);
+          }
+        }
+        Err(e) => {
+          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+          eprintln!("Is the daemon running? Start with: zeptopm daemon");
+          std::process::exit(1);
+        }
+      }
+    }
+    Some(Commands::Stop { name }) => {
+      match http_post(
+        &cli.addr,
+        &format!("/agents/{}/stop", name),
+        &serde_json::json!({}),
+      )
+      .await
+      {
+        Ok(resp_body) => {
+          let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+          if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+            eprintln!("Error: {}", error);
+            std::process::exit(1);
+          }
+          if let Some(status) = resp.get("status").and_then(|v| v.as_str()) {
+            println!("{}", status);
+          }
+        }
+        Err(e) => {
+          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+          std::process::exit(1);
+        }
+      }
+    }
+    Some(Commands::Start { name }) => {
+      match http_post(
+        &cli.addr,
+        &format!("/agents/{}/start", name),
+        &serde_json::json!({}),
+      )
+      .await
+      {
+        Ok(resp_body) => {
+          let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+          if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+            eprintln!("Error: {}", error);
+            std::process::exit(1);
+          }
+          if let Some(status) = resp.get("status").and_then(|v| v.as_str()) {
+            println!("{}", status);
+          }
+        }
+        Err(e) => {
+          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+          std::process::exit(1);
+        }
+      }
+    }
+    Some(Commands::Restart { name }) => {
+      match http_post(
+        &cli.addr,
+        &format!("/agents/{}/restart", name),
+        &serde_json::json!({}),
+      )
+      .await
+      {
+        Ok(resp_body) => {
+          let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+          if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+            eprintln!("Error: {}", error);
+            std::process::exit(1);
+          }
+          if let Some(status) = resp.get("status").and_then(|v| v.as_str()) {
+            println!("{}", status);
+          }
+        }
+        Err(e) => {
+          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+          std::process::exit(1);
+        }
       }
     }
     None => {
@@ -127,5 +265,35 @@ async fn main() {
 
       zeptopm::daemon::run(cli.config, None).await;
     }
+  }
+}
+
+async fn http_get(addr: &str, path: &str) -> Result<String, String> {
+  let url = format!("http://{}{}", addr, path);
+  let resp = reqwest::get(&url)
+    .await
+    .map_err(|e| e.to_string())?;
+  resp.text().await.map_err(|e| e.to_string())
+}
+
+async fn http_post(addr: &str, path: &str, body: &serde_json::Value) -> Result<String, String> {
+  let url = format!("http://{}{}", addr, path);
+  let client = reqwest::Client::new();
+  let resp = client
+    .post(&url)
+    .json(body)
+    .send()
+    .await
+    .map_err(|e| e.to_string())?;
+  resp.text().await.map_err(|e| e.to_string())
+}
+
+fn format_uptime(secs: u64) -> String {
+  if secs < 60 {
+    format!("{}s", secs)
+  } else if secs < 3600 {
+    format!("{}m {}s", secs / 60, secs % 60)
+  } else {
+    format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
   }
 }

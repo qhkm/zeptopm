@@ -12,9 +12,10 @@ use crate::agent::{
 };
 use crate::config::{self, Config};
 use crate::llm::{self, LlmClient};
+use crate::server::{self, DaemonCommand, ManagedAgentRef, SharedState};
 
 /// Run the daemon. This is the main entry point.
-pub async fn run(config_path: String, _bind: Option<String>) {
+pub async fn run(config_path: String, bind: Option<String>) {
   let config = match config::load_config(&config_path) {
     Ok(c) => c,
     Err(e) => {
@@ -40,8 +41,14 @@ pub async fn run(config_path: String, _bind: Option<String>) {
   let llm_client = LlmClient::new();
   let (state_tx, mut state_rx) = mpsc::channel::<AgentStateUpdate>(256);
 
-  // Track agent state
-  let mut agents: HashMap<String, ManagedAgent> = HashMap::new();
+  // Daemon command channel (HTTP handlers -> daemon loop)
+  let (daemon_cmd_tx, mut daemon_cmd_rx) = mpsc::channel::<DaemonCommand>(64);
+
+  // Shared state for HTTP server
+  let shared_state = server::new_shared_state(daemon_cmd_tx);
+
+  // Track internal daemon state (owns JoinHandles, restart config)
+  let mut managed: HashMap<String, InternalAgent> = HashMap::new();
 
   // Spawn auto_start agents
   for agent_config in &config.agents {
@@ -49,9 +56,13 @@ pub async fn run(config_path: String, _bind: Option<String>) {
       continue;
     }
     match spawn_managed_agent(agent_config, &config, &llm_client, state_tx.clone()) {
-      Ok(managed) => {
+      Ok(internal) => {
         info!(agent = %agent_config.name, "agent spawned");
-        agents.insert(agent_config.name.clone(), managed);
+
+        // Update shared state for HTTP
+        sync_agent_to_shared(&shared_state, &agent_config.name, &internal).await;
+
+        managed.insert(agent_config.name.clone(), internal);
       }
       Err(e) => {
         warn!(agent = %agent_config.name, error = %e, "failed to spawn agent");
@@ -59,9 +70,19 @@ pub async fn run(config_path: String, _bind: Option<String>) {
     }
   }
 
-  info!(running = agents.len(), "all auto_start agents spawned");
+  info!(running = managed.len(), "all auto_start agents spawned");
+
+  // Start HTTP server
+  let bind_addr = bind
+    .or_else(|| config.daemon.bind.clone())
+    .unwrap_or_else(|| "127.0.0.1:9876".into());
+  let server_state = shared_state.clone();
+  tokio::spawn(async move {
+    server::start_server(bind_addr, server_state).await;
+  });
 
   // Config watcher state
+  let mut current_config = config.clone();
   let mut last_config_hash = config::config_hash(&config);
   let poll_interval = Duration::from_millis(config.daemon.poll_interval_ms);
 
@@ -100,27 +121,99 @@ pub async fn run(config_path: String, _bind: Option<String>) {
 
       // Agent state updates
       Some(update) = state_rx.recv() => {
-        if let Some(managed) = agents.get_mut(&update.name) {
-          managed.state.tokens_used += update.tokens_delta;
-          managed.state.status = update.status.clone();
+        if let Some(internal) = managed.get_mut(&update.name) {
+          internal.state.tokens_used += update.tokens_delta;
+          internal.state.status = update.status.clone();
           if update.error.is_some() {
-            managed.state.last_error = update.error;
+            internal.state.last_error = update.error;
+          }
+
+          // Sync to shared state for HTTP handlers
+          {
+            let mut s = shared_state.write().await;
+            if let Some(m) = s.agents.get_mut(&update.name) {
+              m.state = internal.state.clone();
+            }
           }
 
           // Handle restart logic for errored agents
           if update.status == AgentStatus::Stopped || update.status == AgentStatus::Error {
-            if managed.state.restart_count < managed.max_restarts {
+            if internal.state.restart_count < internal.max_restarts {
               let backoff = Duration::from_millis(
-                managed.restart_backoff_ms * 2u64.pow(managed.state.restart_count),
+                internal.restart_backoff_ms * 2u64.pow(internal.state.restart_count),
               );
               info!(
                 agent = %update.name,
-                restart = managed.state.restart_count + 1,
+                restart = internal.state.restart_count + 1,
                 backoff_ms = backoff.as_millis() as u64,
                 "scheduling restart"
               );
-              managed.state.status = AgentStatus::RestartPending;
-              managed.restart_at = Some(Instant::now() + backoff);
+              internal.state.status = AgentStatus::RestartPending;
+              internal.restart_at = Some(Instant::now() + backoff);
+            }
+          }
+        }
+      }
+
+      // Daemon commands from HTTP handlers (start/restart)
+      Some(cmd) = daemon_cmd_rx.recv() => {
+        match cmd {
+          DaemonCommand::Start { name, reply } => {
+            if managed.contains_key(&name) {
+              let status = &managed[&name].state.status;
+              if *status != AgentStatus::Stopped && *status != AgentStatus::Error {
+                let _ = reply.send(Err(format!("agent '{}' is already {}", name, status)));
+                continue;
+              }
+              // Remove stopped/errored agent before re-spawning
+              managed.remove(&name);
+              shared_state.write().await.agents.remove(&name);
+            }
+
+            match current_config.agents.iter().find(|a| a.name == name) {
+              Some(agent_config) => {
+                match spawn_managed_agent(agent_config, &current_config, &llm_client, state_tx.clone()) {
+                  Ok(internal) => {
+                    info!(agent = %name, "agent started via command");
+                    sync_agent_to_shared(&shared_state, &name, &internal).await;
+                    managed.insert(name.clone(), internal);
+                    let _ = reply.send(Ok(format!("agent '{}' started", name)));
+                  }
+                  Err(e) => {
+                    let _ = reply.send(Err(format!("failed to start '{}': {}", name, e)));
+                  }
+                }
+              }
+              None => {
+                let _ = reply.send(Err(format!("agent '{}' not found in config", name)));
+              }
+            }
+          }
+          DaemonCommand::Restart { name, reply } => {
+            // Stop existing agent if running
+            if let Some(internal) = managed.remove(&name) {
+              internal.handle.stop().await;
+              shared_state.write().await.agents.remove(&name);
+              info!(agent = %name, "stopped agent for restart");
+            }
+
+            match current_config.agents.iter().find(|a| a.name == name) {
+              Some(agent_config) => {
+                match spawn_managed_agent(agent_config, &current_config, &llm_client, state_tx.clone()) {
+                  Ok(internal) => {
+                    info!(agent = %name, "agent restarted via command");
+                    sync_agent_to_shared(&shared_state, &name, &internal).await;
+                    managed.insert(name.clone(), internal);
+                    let _ = reply.send(Ok(format!("agent '{}' restarted", name)));
+                  }
+                  Err(e) => {
+                    let _ = reply.send(Err(format!("failed to restart '{}': {}", name, e)));
+                  }
+                }
+              }
+              None => {
+                let _ = reply.send(Err(format!("agent '{}' not found in config", name)));
+              }
             }
           }
         }
@@ -133,14 +226,15 @@ pub async fn run(config_path: String, _bind: Option<String>) {
           let new_hash = config::config_hash(&new_config);
           if new_hash != last_config_hash {
             info!(old_hash = last_config_hash, new_hash = new_hash, "config change detected");
-            apply_config_changes(&mut agents, &new_config, &llm_client, state_tx.clone()).await;
+            apply_config_changes(&mut managed, &shared_state, &new_config, &llm_client, state_tx.clone()).await;
+            current_config = new_config;
             last_config_hash = new_hash;
           }
         }
 
         // Check for agents that need restarting
         let now = Instant::now();
-        let restart_names: Vec<String> = agents
+        let restart_names: Vec<String> = managed
           .iter()
           .filter(|(_, m)| {
             m.state.status == AgentStatus::RestartPending
@@ -151,14 +245,16 @@ pub async fn run(config_path: String, _bind: Option<String>) {
 
         for name in restart_names {
           if let Some(agent_config) = config.agents.iter().find(|a| a.name == name) {
-            let restart_count = agents.get(&name).map(|m| m.state.restart_count).unwrap_or(0);
-            agents.remove(&name);
+            let restart_count = managed.get(&name).map(|m| m.state.restart_count).unwrap_or(0);
+            managed.remove(&name);
 
             match spawn_managed_agent(agent_config, &config, &llm_client, state_tx.clone()) {
-              Ok(mut managed) => {
-                managed.state.restart_count = restart_count + 1;
-                info!(agent = %name, restart = managed.state.restart_count, "agent restarted");
-                agents.insert(name, managed);
+              Ok(mut internal) => {
+                internal.state.restart_count = restart_count + 1;
+                info!(agent = %name, restart = internal.state.restart_count, "agent restarted");
+
+                sync_agent_to_shared(&shared_state, &name, &internal).await;
+                managed.insert(name, internal);
               }
               Err(e) => {
                 warn!(agent = %name, error = %e, "restart failed");
@@ -172,8 +268,8 @@ pub async fn run(config_path: String, _bind: Option<String>) {
 
   // Graceful shutdown
   info!("shutting down...");
-  for (name, managed) in &agents {
-    managed.handle.stop().await;
+  for (name, internal) in &managed {
+    internal.handle.stop().await;
     info!(agent = %name, "sent stop to agent");
   }
 
@@ -183,7 +279,7 @@ pub async fn run(config_path: String, _bind: Option<String>) {
   info!("zeptopm stopped");
 }
 
-struct ManagedAgent {
+struct InternalAgent {
   handle: AgentHandle,
   _join: tokio::task::JoinHandle<()>,
   state: AgentState,
@@ -192,12 +288,23 @@ struct ManagedAgent {
   restart_at: Option<Instant>,
 }
 
+async fn sync_agent_to_shared(shared: &SharedState, name: &str, internal: &InternalAgent) {
+  let mut s = shared.write().await;
+  s.agents.insert(
+    name.to_string(),
+    ManagedAgentRef {
+      handle: internal.handle.clone(),
+      state: internal.state.clone(),
+    },
+  );
+}
+
 fn spawn_managed_agent(
   agent_config: &crate::config::AgentConfig,
   config: &Config,
   llm_client: &LlmClient,
   state_tx: mpsc::Sender<AgentStateUpdate>,
-) -> Result<ManagedAgent, String> {
+) -> Result<InternalAgent, String> {
   let provider_config = config.providers.get(&agent_config.provider);
   let api_key = provider_config
     .and_then(|p| p.resolve_api_key())
@@ -212,7 +319,7 @@ fn spawn_managed_agent(
     state_tx,
   );
 
-  Ok(ManagedAgent {
+  Ok(InternalAgent {
     handle,
     _join: join,
     state: AgentState {
@@ -231,13 +338,14 @@ fn spawn_managed_agent(
 }
 
 async fn apply_config_changes(
-  agents: &mut HashMap<String, ManagedAgent>,
+  managed: &mut HashMap<String, InternalAgent>,
+  shared_state: &SharedState,
   new_config: &Config,
   llm_client: &LlmClient,
   state_tx: mpsc::Sender<AgentStateUpdate>,
 ) {
   let running_names: std::collections::HashSet<String> =
-    agents.keys().cloned().collect();
+    managed.keys().cloned().collect();
   let new_names: std::collections::HashSet<String> = new_config
     .agents
     .iter()
@@ -251,8 +359,9 @@ async fn apply_config_changes(
     .cloned()
     .collect();
   for name in &to_remove {
-    if let Some(managed) = agents.remove(name) {
-      managed.handle.stop().await;
+    if let Some(internal) = managed.remove(name) {
+      internal.handle.stop().await;
+      shared_state.write().await.agents.remove(name);
       info!(agent = %name, "removed agent (config change)");
     }
   }
@@ -262,13 +371,14 @@ async fn apply_config_changes(
     if !agent_config.auto_start {
       continue;
     }
-    if agents.contains_key(&agent_config.name) {
+    if managed.contains_key(&agent_config.name) {
       continue;
     }
     match spawn_managed_agent(agent_config, new_config, llm_client, state_tx.clone()) {
-      Ok(managed) => {
+      Ok(internal) => {
         info!(agent = %agent_config.name, "added agent (config change)");
-        agents.insert(agent_config.name.clone(), managed);
+        sync_agent_to_shared(shared_state, &agent_config.name, &internal).await;
+        managed.insert(agent_config.name.clone(), internal);
       }
       Err(e) => {
         warn!(agent = %agent_config.name, error = %e, "failed to add agent");
@@ -277,7 +387,7 @@ async fn apply_config_changes(
   }
 
   let prev_count = running_names.len();
-  if !to_remove.is_empty() || agents.len() != prev_count {
-    info!(total = agents.len(), "config reload complete");
+  if !to_remove.is_empty() || managed.len() != prev_count {
+    info!(total = managed.len(), "config reload complete");
   }
 }
