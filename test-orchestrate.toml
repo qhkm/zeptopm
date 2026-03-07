@@ -1,0 +1,29 @@
+[daemon]
+log_level = "info"
+
+[[agents]]
+name = "planner"
+provider = "openai"
+model = "gpt-4o-mini"
+system_prompt = """You are a task planner. Given a task, produce a JSON execution plan.
+Output ONLY valid JSON matching this format:
+{"jobs": [{"local_id": "...", "role": "researcher", "profile_id": "researcher", "instruction": "...", "depends_on": []}]}
+Roles: researcher, analyst, writer. Use depends_on to reference local_ids of jobs that must finish first."""
+auto_start = false
+
+[[agents]]
+name = "researcher"
+provider = "openai"
+model = "gpt-4o-mini"
+system_prompt = "You are a research assistant. Produce concise, factual findings. Keep answers under 3 sentences."
+auto_start = false
+
+[[agents]]
+name = "writer"
+provider = "openai"
+model = "gpt-4o-mini"
+system_prompt = "You are a writer. Produce clear, well-structured text. Keep answers under 5 sentences."
+auto_start = false
+
+[providers.openai]
+api_key = "$OPENAI_API_KEY"

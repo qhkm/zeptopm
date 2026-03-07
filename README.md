@@ -73,6 +73,9 @@ zeptopm start researcher
 | `zeptopm stop <name>` | Stop a running agent |
 | `zeptopm start <name>` | Start an agent (must be defined in config) |
 | `zeptopm restart <name>` | Restart an agent (stop + start) |
+| `zeptopm run submit <task>` | Submit a multi-step orchestrated run |
+| `zeptopm run status <run_id>` | Show run progress (jobs, artifacts) |
+| `zeptopm run list` | List all runs |
 
 ### Global flags
 
@@ -179,6 +182,7 @@ api_key = "$ANTHROPIC_API_KEY"
 - **Per-agent budget limits** (tokens, USD)
 - **Multi-provider support** — OpenAI, Anthropic, OpenRouter, Groq, Together, or any OpenAI-compatible API
 - **`$ENV_VAR` expansion** for API keys in config
+- **Orchestrated runs** — submit complex tasks, planner decomposes into parallel jobs with dependency graphs
 - **REST API** on port 9876 for programmatic control
 
 ## HTTP API
@@ -194,6 +198,9 @@ The daemon exposes a REST API (default `127.0.0.1:9876`):
 | `/agents/{name}/stop` | POST | Stop agent |
 | `/agents/{name}/start` | POST | Start agent |
 | `/agents/{name}/restart` | POST | Restart agent |
+| `/runs` | POST | Submit orchestrated run |
+| `/runs/{id}` | GET | Run status with job details |
+| `/runs` | GET | List all runs |
 
 ## Architecture
 
