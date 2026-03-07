@@ -82,6 +82,32 @@ zeptopm start researcher
 | `-l, --log-level` | from config | Override log level (trace/debug/info/warn/error) |
 | `--addr` | `127.0.0.1:9876` | Daemon HTTP address |
 
+## Resource Usage
+
+Each agent runs as a separate OS process for full isolation. The footprint is small — the bottleneck is always the LLM API, not zeptoPM itself.
+
+**Measured on macOS (Apple Silicon), release build:**
+
+| Component | RSS (idle) |
+|-----------|-----------|
+| Daemon (supervisor) | ~4 MB |
+| Each worker process | ~4 MB |
+| Release binary | ~11 MB |
+
+### Capacity Estimates
+
+| Machine RAM | Agents (theoretical max) | Agents (comfortable) |
+|-------------|--------------------------|----------------------|
+| 512 MB | ~120 | 50–80 |
+| 1 GB | ~250 | 100–150 |
+| 4 GB | ~1,000 | 500–800 |
+| 8 GB | ~2,000 | 1,000+ |
+
+**Notes:**
+- CPU usage is near-zero while idle — workers block on stdin waiting for commands. Active CPU comes from HTTP request handling and JSON serialization, not from zeptoPM itself.
+- Memory grows with conversation history. With `max_history = 200` and typical messages (~200 bytes each), each agent adds ~40 KB on top of the base ~4 MB.
+- The real constraint for most deployments is **LLM API rate limits and cost**, not local resources. A $5/month VPS can comfortably run dozens of agents.
+
 ## Config Reference
 
 ```toml
@@ -90,6 +116,7 @@ poll_interval_ms = 5000       # How often to check for config changes
 log_level = "info"             # trace | debug | info | warn | error
 log_format = "pretty"          # pretty | compact | json
 bind = "127.0.0.1:9876"       # HTTP API bind address
+sessions_dir = "~/.zeptopm/sessions"  # Where session files are stored
 
 [[agents]]
 name = "researcher"            # Unique agent name
@@ -100,6 +127,8 @@ auto_start = true              # Start automatically with daemon
 max_restarts = 5               # Max auto-restarts on failure
 restart_backoff_ms = 1000      # Initial backoff (doubles each restart)
 max_iterations = 10            # Max tool-calling iterations per message
+session_persist = true         # Save conversation history across restarts
+max_history = 200              # Keep last N messages (omit for unlimited)
 
 [agents.budget]
 token_limit = 100000           # Max tokens per agent
@@ -130,7 +159,9 @@ api_key = "$ANTHROPIC_API_KEY"
 ## Features
 
 - **Config-driven** — define agents in TOML, no code required
-- **Conversation history** — agents maintain full chat context (powered by [zeptoclaw](https://crates.io/crates/zeptoclaw))
+- **Process isolation** — each agent runs as a separate OS process (~4 MB each)
+- **Session persistence** — agents remember conversations across restarts (JSON files)
+- **Bounded history** — `max_history` caps stored messages to prevent unbounded growth
 - **Automatic restart** with exponential backoff
 - **Hot config reload** — add/remove agents without restarting the daemon
 - **Per-agent budget limits** (tokens, USD)
@@ -155,13 +186,24 @@ The daemon exposes a REST API (default `127.0.0.1:9876`):
 ## Architecture
 
 ```
-zeptopm.toml → Config Parser → Daemon Loop → Agent Processes (tokio tasks)
-                                    ↑              ↓
-                              Config Watcher    zeptoclaw ZeptoAgent
-                              (hot reload)    (conversation + providers)
-                                    ↑              ↓
-                              HTTP API ←→    OpenRouter / OpenAI / Anthropic
-                            (port 9876)
+zeptopm.toml → Config Parser → Daemon (supervisor)
+                                    ↑
+                              Config Watcher (hot reload)
+                              HTTP API (port 9876)
+                                    ↓
+                    ┌───────────────┼───────────────┐
+                    ↓               ↓               ↓
+              Worker Process   Worker Process   Worker Process
+              (agent "foo")    (agent "bar")    (agent "baz")
+                    ↓               ↓               ↓
+              JSON lines       JSON lines       JSON lines
+              over stdio       over stdio       over stdio
+                    ↓               ↓               ↓
+              ZeptoAgent       ZeptoAgent       ZeptoAgent
+                    ↓               ↓               ↓
+              LLM Provider     LLM Provider     LLM Provider
+                    ↓               ↓               ↓
+              ~/.zeptopm/sessions/{agent}.json (persistent history)
 ```
 
 ## License
