@@ -132,6 +132,16 @@ pub fn spawn_agent(
   config_path: &str,
   state_tx: mpsc::Sender<AgentStateUpdate>,
 ) -> (AgentHandle, tokio::task::JoinHandle<()>) {
+  spawn_agent_with_orch(agent_name, config_path, state_tx, None)
+}
+
+/// Spawn an agent with an optional orchestrator event channel.
+pub fn spawn_agent_with_orch(
+  agent_name: &str,
+  config_path: &str,
+  state_tx: mpsc::Sender<AgentStateUpdate>,
+  orch_event_tx: Option<mpsc::Sender<serde_json::Value>>,
+) -> (AgentHandle, tokio::task::JoinHandle<()>) {
   let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCommand>(64);
 
   let handle = AgentHandle {
@@ -144,6 +154,7 @@ pub fn spawn_agent(
     config_path.to_string(),
     cmd_rx,
     state_tx,
+    orch_event_tx,
   ));
 
   (handle, join)
@@ -156,6 +167,7 @@ async fn worker_bridge(
   config_path: String,
   mut cmd_rx: mpsc::Receiver<AgentCommand>,
   state_tx: mpsc::Sender<AgentStateUpdate>,
+  orch_event_tx: Option<mpsc::Sender<serde_json::Value>>,
 ) {
   let exe = match std::env::current_exe() {
     Ok(e) => e,
@@ -362,6 +374,10 @@ async fn worker_bridge(
                     pid: child_pid,
                   })
                   .await;
+                // Forward to orchestrator engine
+                if let Some(ref orch_tx) = orch_event_tx {
+                  let _ = orch_tx.send(msg.clone()).await;
+                }
               }
               _ => {
                 debug!(agent = %agent_name, msg_type = msg_type, "unknown worker message type");

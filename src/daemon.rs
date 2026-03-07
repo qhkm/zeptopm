@@ -51,6 +51,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
 
   // Initialize orchestrator
   let mut orchestrator = OrchestratorEngine::new(4);
+  let (orch_event_tx, mut orch_event_rx) = mpsc::channel::<serde_json::Value>(256);
 
   // Spawn auto_start agents
   for agent_config in &config.agents {
@@ -222,8 +223,77 @@ pub async fn run(config_path: String, bind: Option<String>) {
           DaemonCommand::SubmitRun { task, reply } => {
             let run_id = orchestrator.submit_run(task);
             info!(run_id = %run_id, "new orchestrated run submitted");
+
+            // Spawn ready jobs from the new run
+            while let Some(job) = orchestrator.next_job() {
+              info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
+              orchestrator.mark_running(&job.job_id);
+              spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state).await;
+            }
+
             let _ = reply.send(Ok(run_id));
           }
+          DaemonCommand::GetRunStatus { run_id, reply } => {
+            let result = get_run_status_data(&orchestrator, &run_id);
+            let _ = reply.send(result);
+          }
+          DaemonCommand::ListRuns { reply } => {
+            let runs = get_runs_list_data(&orchestrator);
+            let _ = reply.send(Ok(runs));
+          }
+        }
+      }
+
+      // Orchestrator events from job workers
+      Some(event) = orch_event_rx.recv() => {
+        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match event_type {
+          "job_completed" => {
+            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+            let artifacts: Vec<String> = event.get("output_artifact_ids")
+              .and_then(|v| v.as_array())
+              .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+              .unwrap_or_default();
+            orchestrator.mark_completed(job_id, artifacts);
+            info!(job_id = %job_id, "job completed");
+
+            // Spawn newly ready jobs
+            while let Some(job) = orchestrator.next_job() {
+              info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
+              orchestrator.mark_running(&job.job_id);
+              spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state).await;
+            }
+          }
+          "job_failed" => {
+            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+            let error = event.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+            orchestrator.mark_failed(job_id, error.to_string());
+            warn!(job_id = %job_id, error = %error, "job failed");
+
+            // Spawn retry if re-queued
+            while let Some(job) = orchestrator.next_job() {
+              info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry)");
+              orchestrator.mark_running(&job.job_id);
+              spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state).await;
+            }
+          }
+          "artifact_produced" => {
+            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+            let run_id = orchestrator.store.get_job(job_id)
+              .map(|j| j.run_id.clone())
+              .unwrap_or_default();
+            let artifact = crate::orchestrator::types::Artifact {
+              artifact_id: event.get("artifact_id").and_then(|v| v.as_str()).unwrap_or("").into(),
+              run_id,
+              job_id: job_id.into(),
+              kind: event.get("kind").and_then(|v| v.as_str()).unwrap_or("").into(),
+              path: event.get("path").and_then(|v| v.as_str()).unwrap_or("").into(),
+              summary: event.get("summary").and_then(|v| v.as_str()).unwrap_or("").into(),
+              created_at: std::time::SystemTime::now(),
+            };
+            orchestrator.store.create_artifact(artifact);
+          }
+          _ => {}
         }
       }
 
@@ -394,4 +464,81 @@ async fn apply_config_changes(
   if !to_remove.is_empty() || managed.len() != prev_count {
     info!(total = managed.len(), "config reload complete");
   }
+}
+
+/// Spawn a temporary worker process for an orchestration job.
+/// Sends a `job_execute` command via the worker's stdin.
+async fn spawn_job_worker(
+  job: &crate::orchestrator::types::Job,
+  config_path: &str,
+  config: &Config,
+  state_tx: mpsc::Sender<AgentStateUpdate>,
+  orch_event_tx: mpsc::Sender<serde_json::Value>,
+  _managed: &mut HashMap<String, InternalAgent>,
+  _shared_state: &SharedState,
+) {
+  // Find an agent config matching the job's role/profile_id
+  let agent_config = match config.agents.iter().find(|a| a.name == job.profile_id) {
+    Some(c) => c,
+    None => {
+      warn!(job_id = %job.job_id, profile = %job.profile_id, "no agent profile found for job");
+      let _ = orch_event_tx.send(serde_json::json!({
+        "type": "job_failed",
+        "job_id": job.job_id,
+        "error": format!("no agent profile '{}' found in config", job.profile_id),
+        "retryable": false
+      })).await;
+      return;
+    }
+  };
+
+  // Spawn a worker using the matching agent profile
+  let (handle, _join) = crate::agent::spawn_agent_with_orch(
+    &agent_config.name,
+    config_path,
+    state_tx.clone(),
+    Some(orch_event_tx.clone()),
+  );
+
+  // Send the job instruction via the worker's chat command
+  // The worker will process it and emit job_completed/job_failed events via orch_event_tx
+  let _ = handle.send_message(job.instruction.clone()).await;
+}
+
+fn get_run_status_data(
+  orchestrator: &OrchestratorEngine,
+  run_id: &str,
+) -> Result<serde_json::Value, String> {
+  let run = orchestrator.store.get_run(run_id)
+    .ok_or_else(|| format!("run '{}' not found", run_id))?;
+
+  let jobs = orchestrator.store.list_run_jobs(run_id);
+  let job_infos: Vec<serde_json::Value> = jobs.iter().map(|j| {
+    serde_json::json!({
+      "job_id": j.job_id,
+      "role": j.role,
+      "status": format!("{:?}", j.status),
+      "instruction": j.instruction.chars().take(100).collect::<String>(),
+      "attempt": j.attempt,
+      "error": j.error,
+    })
+  }).collect();
+
+  Ok(serde_json::json!({
+    "run_id": run.run_id,
+    "task": run.task,
+    "status": format!("{:?}", run.status),
+    "jobs": job_infos,
+  }))
+}
+
+fn get_runs_list_data(orchestrator: &OrchestratorEngine) -> serde_json::Value {
+  let runs: Vec<serde_json::Value> = orchestrator.store.list_runs().iter().map(|r| {
+    serde_json::json!({
+      "run_id": r.run_id,
+      "task": r.task,
+      "status": format!("{:?}", r.status),
+    })
+  }).collect();
+  serde_json::json!({ "runs": runs })
 }

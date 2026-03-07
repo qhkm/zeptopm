@@ -19,6 +19,13 @@ system_prompt = "You are a research assistant. Produce concise, factual findings
 auto_start = false
 
 [[agents]]
+name = "analyst"
+provider = "openai"
+model = "gpt-4o-mini"
+system_prompt = "You are a data analyst. Synthesize findings into key insights. Keep answers under 5 sentences."
+auto_start = false
+
+[[agents]]
 name = "writer"
 provider = "openai"
 model = "gpt-4o-mini"

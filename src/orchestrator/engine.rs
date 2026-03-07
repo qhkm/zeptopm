@@ -78,12 +78,27 @@ impl OrchestratorEngine {
         Some(job)
     }
 
-    /// Mark a job as running.
+    /// Mark a job as running. Also transitions the parent run to Running if still Pending.
     pub fn mark_running(&mut self, job_id: &str) {
+        if !self.active_jobs.contains_key(job_id) {
+            return;
+        }
+        let run_id = self.active_jobs.get(job_id).cloned();
         if let Some(job) = self.store.get_job_mut(job_id) {
             job.status = JobStatus::Running;
             job.started_at = Some(SystemTime::now());
             job.attempt += 1;
+        }
+        // Transition run from Pending to Running on first job start
+        if let Some(run_id) = run_id {
+            if let Some(run) = self.store.get_run(&run_id) {
+                if run.status == RunStatus::Pending {
+                    let mut run = run.clone();
+                    run.status = RunStatus::Running;
+                    run.updated_at = SystemTime::now();
+                    self.store.update_run(run);
+                }
+            }
         }
     }
 
@@ -109,12 +124,13 @@ impl OrchestratorEngine {
         let run_id = self.active_jobs.remove(job_id);
         if let Some(job) = self.store.get_job_mut(job_id) {
             job.error = Some(error);
-            job.finished_at = Some(SystemTime::now());
             if job.attempt < job.max_attempts {
                 job.status = JobStatus::Ready;
+                job.finished_at = None;
                 self.ready_queue.push_back(job_id.to_string());
             } else {
                 job.status = JobStatus::Failed;
+                job.finished_at = Some(SystemTime::now());
             }
         }
         if let Some(run_id) = run_id {
@@ -214,5 +230,41 @@ mod tests {
         assert_eq!(engine.ready_queue.len(), 1); // re-queued
         let j = engine.store.get_job(&job.job_id).unwrap();
         assert_eq!(j.status, JobStatus::Ready);
+        assert!(j.finished_at.is_none()); // not finished yet — will retry
+    }
+
+    #[test]
+    fn test_mark_failed_exhausts_retries() {
+        let mut engine = OrchestratorEngine::new(4);
+        engine.submit_run("test".into());
+        let job_id = {
+            let job = engine.next_job().unwrap();
+            job.job_id.clone()
+        };
+
+        // Exhaust all 3 attempts
+        for i in 0..3 {
+            engine.mark_running(&job_id);
+            engine.mark_failed(&job_id, format!("fail {}", i + 1));
+            if i < 2 {
+                // Re-dequeue for next attempt
+                let _ = engine.next_job().unwrap();
+            }
+        }
+
+        let j = engine.store.get_job(&job_id).unwrap();
+        assert_eq!(j.status, JobStatus::Failed);
+        assert!(j.finished_at.is_some());
+    }
+
+    #[test]
+    fn test_mark_running_transitions_run_to_running() {
+        let mut engine = OrchestratorEngine::new(4);
+        let run_id = engine.submit_run("test".into());
+        assert_eq!(engine.store.get_run(&run_id).unwrap().status, RunStatus::Pending);
+
+        let job = engine.next_job().unwrap();
+        engine.mark_running(&job.job_id);
+        assert_eq!(engine.store.get_run(&run_id).unwrap().status, RunStatus::Running);
     }
 }
