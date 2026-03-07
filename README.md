@@ -82,9 +82,21 @@ zeptopm start researcher
 | `-l, --log-level` | from config | Override log level (trace/debug/info/warn/error) |
 | `--addr` | `127.0.0.1:9876` | Daemon HTTP address |
 
-## Resource Usage
+## Process Isolation
 
-Each agent runs as a separate OS process for full isolation. The footprint is small — the bottleneck is always the LLM API, not zeptoPM itself.
+Each agent runs as a **separate OS process**. Memory, conversation history, and session storage are fully isolated between agents — one agent crashing or leaking memory cannot affect another.
+
+| Resource | Isolation |
+|----------|-----------|
+| **Memory (heap)** | Separate address space per process |
+| **Conversation history** | Independent in-memory `Vec<Message>` per agent |
+| **Session file** | `~/.zeptopm/sessions/{agent_name}.json` — one file per agent |
+| **LLM provider state** | Each worker creates its own HTTP client and auth context |
+| **Crash blast radius** | Worker crash is caught by supervisor, other agents unaffected |
+
+The daemon supervisor communicates with each worker over JSON lines on stdin/stdout. Workers never share state directly.
+
+## Resource Usage
 
 **Measured on macOS (Apple Silicon), release build:**
 
