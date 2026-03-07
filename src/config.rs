@@ -58,6 +58,29 @@ pub struct AgentConfig {
   pub timeout_ms: Option<u64>,
   #[serde(default)]
   pub budget: Option<BudgetConfig>,
+  #[serde(default)]
+  pub gateway: Option<GatewayConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GatewayConfig {
+  #[serde(default)]
+  pub enabled: bool,
+  pub api_key: Option<String>,
+  pub rate_limit: Option<u32>,
+}
+
+impl GatewayConfig {
+  /// Resolve the API key, expanding `$ENV_VAR` references.
+  pub fn resolve_api_key(&self) -> Option<String> {
+    self.api_key.as_ref().and_then(|key| {
+      if let Some(env_name) = key.strip_prefix('$') {
+        std::env::var(env_name).ok().filter(|v| !v.is_empty())
+      } else {
+        Some(key.clone())
+      }
+    })
+  }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,6 +264,7 @@ mod tests {
         max_iterations: None,
         timeout_ms: None,
         budget: None,
+        gateway: None,
       }],
       providers: HashMap::new(),
     };
@@ -263,6 +287,7 @@ mod tests {
       max_iterations: None,
       timeout_ms: None,
       budget: None,
+      gateway: None,
     };
     let config = Config {
       daemon: DaemonConfig::default(),

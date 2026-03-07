@@ -1,10 +1,11 @@
 //! HTTP server — REST API for agent management.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Json;
 use axum::routing::{get, post};
 use axum::Router;
@@ -33,12 +34,66 @@ pub enum DaemonCommand {
 pub struct DaemonState {
   pub agents: HashMap<String, ManagedAgentRef>,
   pub daemon_tx: tokio::sync::mpsc::Sender<DaemonCommand>,
+  pub rate_limits: HashMap<String, RateLimitBucket>,
 }
 
 /// Lightweight reference to a managed agent for HTTP handlers.
 pub struct ManagedAgentRef {
   pub handle: AgentHandle,
   pub state: AgentState,
+  pub gateway: Option<ResolvedGatewayConfig>,
+}
+
+/// Resolved gateway config (env vars already expanded).
+#[derive(Clone)]
+pub struct ResolvedGatewayConfig {
+  pub enabled: bool,
+  pub api_key: Option<String>,
+  pub rate_limit: Option<u32>,
+}
+
+/// Simple sliding-window rate limiter (per agent, requests per minute).
+pub struct RateLimitBucket {
+  window: VecDeque<Instant>,
+  limit: u32,
+}
+
+impl RateLimitBucket {
+  pub fn new(limit: u32) -> Self {
+    Self {
+      window: VecDeque::new(),
+      limit,
+    }
+  }
+
+  pub fn check_and_record(&mut self) -> bool {
+    let now = Instant::now();
+    let one_minute_ago = now - Duration::from_secs(60);
+    while self
+      .window
+      .front()
+      .map(|t| *t < one_minute_ago)
+      .unwrap_or(false)
+    {
+      self.window.pop_front();
+    }
+    if self.window.len() as u32 >= self.limit {
+      return false;
+    }
+    self.window.push_back(now);
+    true
+  }
+
+  pub fn remaining(&self) -> u32 {
+    let now = Instant::now();
+    let one_minute_ago = now - Duration::from_secs(60);
+    let active = self
+      .window
+      .iter()
+      .filter(|t| **t >= one_minute_ago)
+      .count() as u32;
+    self.limit.saturating_sub(active)
+  }
 }
 
 pub type SharedState = Arc<RwLock<DaemonState>>;
@@ -49,6 +104,7 @@ pub fn new_shared_state(
   Arc::new(RwLock::new(DaemonState {
     agents: HashMap::new(),
     daemon_tx,
+    rate_limits: HashMap::new(),
   }))
 }
 
@@ -112,6 +168,8 @@ pub fn build_router(state: SharedState) -> Router {
     .route("/agents/{name}/status", get(get_agent_status))
     .route("/agents/{name}/logs", get(get_agent_logs))
     .route("/orchestrate/{name}", post(post_orchestrate))
+    .route("/gw/{name}/chat", post(gateway_chat))
+    .route("/health", get(get_health))
     .with_state(state)
 }
 
@@ -453,6 +511,112 @@ async fn post_orchestrate(
     delegations: all_delegations,
     rounds,
   }))
+}
+
+// --- Health endpoint (for external gateways / load balancers) ---
+
+#[derive(Serialize)]
+struct HealthResponse {
+  status: String,
+  agents: usize,
+}
+
+async fn get_health(State(state): State<SharedState>) -> Json<HealthResponse> {
+  let s = state.read().await;
+  let running = s
+    .agents
+    .values()
+    .filter(|m| {
+      m.state.status == AgentStatus::Running || m.state.status == AgentStatus::Idle
+    })
+    .count();
+  Json(HealthResponse {
+    status: "ok".into(),
+    agents: running,
+  })
+}
+
+// --- Gateway endpoint (built-in API key auth + rate limiting) ---
+
+#[derive(Serialize)]
+struct GatewayResponse {
+  agent: String,
+  response: String,
+}
+
+#[derive(Serialize)]
+struct GatewayErrorResponse {
+  error: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  retry_after_secs: Option<u32>,
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+  headers
+    .get("authorization")
+    .and_then(|v| v.to_str().ok())
+    .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+async fn gateway_chat(
+  State(state): State<SharedState>,
+  Path(name): Path<String>,
+  headers: HeaderMap,
+  Json(body): Json<ChatRequest>,
+) -> Result<Json<GatewayResponse>, (StatusCode, Json<GatewayErrorResponse>)> {
+  let gw_err =
+    |status: StatusCode, msg: &str| (status, Json(GatewayErrorResponse { error: msg.into(), retry_after_secs: None }));
+
+  // Look up agent + gateway config
+  let (handle, gateway_config) = {
+    let s = state.read().await;
+    match s.agents.get(&name) {
+      Some(m) => (m.handle.clone(), m.gateway.clone()),
+      None => return Err(gw_err(StatusCode::NOT_FOUND, &format!("agent '{}' not found", name))),
+    }
+  };
+
+  // Check gateway is enabled
+  let gw = match gateway_config {
+    Some(g) if g.enabled => g,
+    _ => return Err(gw_err(StatusCode::FORBIDDEN, &format!("gateway not enabled for agent '{}'", name))),
+  };
+
+  // API key auth
+  if let Some(ref expected_key) = gw.api_key {
+    match extract_bearer_token(&headers) {
+      Some(token) if token == expected_key => {}
+      Some(_) => return Err(gw_err(StatusCode::UNAUTHORIZED, "invalid API key")),
+      None => return Err(gw_err(StatusCode::UNAUTHORIZED, "missing Authorization: Bearer <key> header")),
+    }
+  }
+
+  // Rate limiting
+  if let Some(limit) = gw.rate_limit {
+    let mut s = state.write().await;
+    let bucket = s
+      .rate_limits
+      .entry(name.clone())
+      .or_insert_with(|| RateLimitBucket::new(limit));
+    if !bucket.check_and_record() {
+      return Err((
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(GatewayErrorResponse {
+          error: format!("rate limit exceeded ({}/min)", limit),
+          retry_after_secs: Some(60),
+        }),
+      ));
+    }
+  }
+
+  // Proxy to agent
+  match handle.chat(body.message).await {
+    Ok(content) => Ok(Json(GatewayResponse {
+      agent: name,
+      response: content,
+    })),
+    Err(e) => Err(gw_err(StatusCode::INTERNAL_SERVER_ERROR, &e)),
+  }
 }
 
 /// Start the HTTP server on the given bind address.

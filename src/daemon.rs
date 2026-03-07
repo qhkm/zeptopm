@@ -13,7 +13,7 @@ use crate::agent::{
   push_log, spawn_agent, AgentHandle, AgentState, AgentStateUpdate, AgentStatus,
 };
 use crate::config::{self, Config};
-use crate::server::{self, DaemonCommand, ManagedAgentRef, SharedState};
+use crate::server::{self, DaemonCommand, ManagedAgentRef, ResolvedGatewayConfig, SharedState};
 
 /// Run the daemon. This is the main entry point.
 pub async fn run(config_path: String, bind: Option<String>) {
@@ -281,6 +281,7 @@ struct InternalAgent {
   max_restarts: u32,
   restart_backoff_ms: u64,
   restart_at: Option<Instant>,
+  gateway: Option<ResolvedGatewayConfig>,
 }
 
 async fn sync_agent_to_shared(shared: &SharedState, name: &str, internal: &InternalAgent) {
@@ -290,6 +291,7 @@ async fn sync_agent_to_shared(shared: &SharedState, name: &str, internal: &Inter
     ManagedAgentRef {
       handle: internal.handle.clone(),
       state: internal.state.clone(),
+      gateway: internal.gateway.clone(),
     },
   );
 }
@@ -337,6 +339,12 @@ fn spawn_managed_agent(
 
   let (handle, join) = spawn_agent(agent_config.clone(), provider, state_tx);
 
+  let gateway = agent_config.gateway.as_ref().map(|gw| ResolvedGatewayConfig {
+    enabled: gw.enabled,
+    api_key: gw.resolve_api_key(),
+    rate_limit: gw.rate_limit,
+  });
+
   Ok(InternalAgent {
     handle,
     _join: join,
@@ -353,6 +361,7 @@ fn spawn_managed_agent(
     max_restarts: agent_config.max_restarts,
     restart_backoff_ms: agent_config.restart_backoff_ms,
     restart_at: None,
+    gateway,
   })
 }
 

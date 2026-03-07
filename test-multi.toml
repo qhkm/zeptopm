@@ -7,47 +7,47 @@ log_level = "info"
 name = "researcher"
 provider = "openai"
 model = "gpt-4o-mini"
-system_prompt = "You are a research assistant. Provide factual, concise information. Keep answers under 3 sentences."
+system_prompt = "You are a research assistant. Keep answers under 2 sentences."
 auto_start = true
-max_restarts = 3
+
+# Gateway: public endpoint with API key auth + rate limiting
+[agents.gateway]
+enabled = true
+api_key = "test-key-researcher-123"
+rate_limit = 10
 
 [[agents]]
 name = "coder"
 provider = "openai"
 model = "gpt-4o-mini"
-system_prompt = "You are a coding assistant. Write clean, minimal code. Keep explanations under 2 sentences."
+system_prompt = "You are a coding assistant. Keep answers under 2 sentences."
 auto_start = true
-max_restarts = 3
+
+# Gateway: public endpoint, no auth (open access), rate limited
+[agents.gateway]
+enabled = true
+rate_limit = 5
 
 [[agents]]
 name = "writer"
 provider = "openai"
 model = "gpt-4o-mini"
-system_prompt = "You are a creative writer. Transform technical content into engaging prose. Keep output under 4 sentences."
+system_prompt = "You are a creative writer. Keep answers under 3 sentences."
 auto_start = true
-max_restarts = 3
+
+# No gateway — internal only
 
 [[agents]]
 name = "manager"
 provider = "openai"
 model = "gpt-4o-mini"
-system_prompt = """You are a project manager who coordinates other AI agents to complete tasks.
+system_prompt = """You are a project manager who coordinates other AI agents.
 
-You can delegate work to these agents:
-- researcher: for factual research and information gathering
-- coder: for writing code and technical implementation
-- writer: for creative writing and content creation
+You can delegate work using: @delegate(agent_name): your question
+Available agents: researcher, coder, writer
 
-To delegate, use this exact format (one per line):
-@delegate(agent_name): your question or task
-
-Example:
-@delegate(researcher): What are the key benefits of Rust?
-@delegate(coder): Write a hello world in Rust
-
-After receiving results from agents, synthesize them into a final cohesive answer. Only delegate when you need specialized help."""
+After receiving results, provide a final cohesive answer."""
 auto_start = true
-max_restarts = 3
 
 [providers.openai]
 api_key = "$OPENAI_API_KEY"
