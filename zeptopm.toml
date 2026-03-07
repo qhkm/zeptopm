@@ -1,0 +1,41 @@
+# zeptoPM — Process Manager for AI Agents
+# Configure your agents and run: zeptopm daemon
+
+[daemon]
+poll_interval_ms = 5000
+log_level = "info"
+# bind = "127.0.0.1:9400"
+
+# --- Agents ---
+
+[[agents]]
+name = "researcher"
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4"
+system_prompt = "You are a research assistant. Help users find and synthesize information."
+tools = ["web_fetch"]
+auto_start = true
+max_restarts = 5
+restart_backoff_ms = 10000
+
+[agents.budget]
+token_limit = 100000
+cost_limit_usd = 5.00
+
+[[agents]]
+name = "coder"
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4"
+system_prompt = "You are a coding assistant. Help users write and debug code."
+tools = ["filesystem", "shell"]
+auto_start = true
+
+# --- Providers ---
+
+[providers.openrouter]
+api_key = "$OPENROUTER_API_KEY"
+base_url = "https://openrouter.ai/api/v1"
+
+# [providers.openai]
+# api_key = "$OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"
