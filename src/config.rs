@@ -65,6 +65,8 @@ pub struct AgentConfig {
   pub gateway: Option<GatewayConfig>,
   #[serde(default = "default_true")]
   pub session_persist: bool,
+  #[serde(default)]
+  pub max_history: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -296,6 +298,7 @@ mod tests {
         budget: None,
         gateway: None,
         session_persist: true,
+        max_history: None,
       }],
       providers: HashMap::new(),
     };
@@ -320,6 +323,7 @@ mod tests {
       budget: None,
       gateway: None,
       session_persist: true,
+      max_history: None,
     };
     let config = Config {
       daemon: DaemonConfig::default(),

@@ -42,6 +42,7 @@ pub async fn run(agent_name: String, config_path: String) {
   } else {
     None
   };
+  let max_history = agent_config.max_history;
 
   // Load saved history if session persistence is enabled
   let saved_history = session_file
@@ -129,18 +130,19 @@ pub async fn run(agent_name: String, config_path: String) {
           }
         }
 
-        // Save history after each chat
+        // Save history after each chat (truncated if max_history set)
         if let Some(ref path) = session_file {
           let history = agent.history().await;
-          save_history(path, &history);
+          save_history(path, &truncate_history(history, max_history));
         }
 
         send_status("idle", None);
       }
       Some("stop") => {
-        // Save history before stopping
+        // Save history before stopping (truncated if max_history set)
         if let Some(ref path) = session_file {
           let history = agent.history().await;
+          let history = truncate_history(history, max_history);
           save_history(path, &history);
           send_log("info", &format!("session saved ({} messages)", history.len()));
         }
@@ -151,6 +153,25 @@ pub async fn run(agent_name: String, config_path: String) {
       _ => {}
     }
   }
+}
+
+/// Truncate history to at most `max` messages (keeping the most recent).
+/// Always keeps an even number of messages to preserve user/assistant pairs.
+fn truncate_history(
+  history: Vec<zeptoclaw::session::Message>,
+  max: Option<usize>,
+) -> Vec<zeptoclaw::session::Message> {
+  let Some(max) = max else { return history };
+  let len = history.len();
+  if len <= max {
+    return history;
+  }
+  // Round max down to even to keep user/assistant pairs intact
+  let max = max & !1;
+  if max == 0 {
+    return Vec::new();
+  }
+  history.into_iter().skip(len - max).collect()
 }
 
 /// Load conversation history from a JSON file.
