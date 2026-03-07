@@ -3,15 +3,16 @@
 //! Manages agent lifecycle: spawn, monitor, restart, hot-reload config.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+use zeptoclaw::providers::LLMProvider;
 
 use crate::agent::{
   spawn_agent, AgentHandle, AgentState, AgentStateUpdate, AgentStatus,
 };
 use crate::config::{self, Config};
-use crate::llm::{self, LlmClient};
 use crate::server::{self, DaemonCommand, ManagedAgentRef, SharedState};
 
 /// Run the daemon. This is the main entry point.
@@ -38,7 +39,6 @@ pub async fn run(config_path: String, bind: Option<String>) {
     "zeptopm daemon starting"
   );
 
-  let llm_client = LlmClient::new();
   let (state_tx, mut state_rx) = mpsc::channel::<AgentStateUpdate>(256);
 
   // Daemon command channel (HTTP handlers -> daemon loop)
@@ -55,13 +55,10 @@ pub async fn run(config_path: String, bind: Option<String>) {
     if !agent_config.auto_start {
       continue;
     }
-    match spawn_managed_agent(agent_config, &config, &llm_client, state_tx.clone()) {
+    match spawn_managed_agent(agent_config, &config, state_tx.clone()) {
       Ok(internal) => {
         info!(agent = %agent_config.name, "agent spawned");
-
-        // Update shared state for HTTP
         sync_agent_to_shared(&shared_state, &agent_config.name, &internal).await;
-
         managed.insert(agent_config.name.clone(), internal);
       }
       Err(e) => {
@@ -165,14 +162,13 @@ pub async fn run(config_path: String, bind: Option<String>) {
                 let _ = reply.send(Err(format!("agent '{}' is already {}", name, status)));
                 continue;
               }
-              // Remove stopped/errored agent before re-spawning
               managed.remove(&name);
               shared_state.write().await.agents.remove(&name);
             }
 
             match current_config.agents.iter().find(|a| a.name == name) {
               Some(agent_config) => {
-                match spawn_managed_agent(agent_config, &current_config, &llm_client, state_tx.clone()) {
+                match spawn_managed_agent(agent_config, &current_config, state_tx.clone()) {
                   Ok(internal) => {
                     info!(agent = %name, "agent started via command");
                     sync_agent_to_shared(&shared_state, &name, &internal).await;
@@ -190,7 +186,6 @@ pub async fn run(config_path: String, bind: Option<String>) {
             }
           }
           DaemonCommand::Restart { name, reply } => {
-            // Stop existing agent if running
             if let Some(internal) = managed.remove(&name) {
               internal.handle.stop().await;
               shared_state.write().await.agents.remove(&name);
@@ -199,7 +194,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
 
             match current_config.agents.iter().find(|a| a.name == name) {
               Some(agent_config) => {
-                match spawn_managed_agent(agent_config, &current_config, &llm_client, state_tx.clone()) {
+                match spawn_managed_agent(agent_config, &current_config, state_tx.clone()) {
                   Ok(internal) => {
                     info!(agent = %name, "agent restarted via command");
                     sync_agent_to_shared(&shared_state, &name, &internal).await;
@@ -226,7 +221,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
           let new_hash = config::config_hash(&new_config);
           if new_hash != last_config_hash {
             info!(old_hash = last_config_hash, new_hash = new_hash, "config change detected");
-            apply_config_changes(&mut managed, &shared_state, &new_config, &llm_client, state_tx.clone()).await;
+            apply_config_changes(&mut managed, &shared_state, &new_config, state_tx.clone()).await;
             current_config = new_config;
             last_config_hash = new_hash;
           }
@@ -244,15 +239,14 @@ pub async fn run(config_path: String, bind: Option<String>) {
           .collect();
 
         for name in restart_names {
-          if let Some(agent_config) = config.agents.iter().find(|a| a.name == name) {
+          if let Some(agent_config) = current_config.agents.iter().find(|a| a.name == name) {
             let restart_count = managed.get(&name).map(|m| m.state.restart_count).unwrap_or(0);
             managed.remove(&name);
 
-            match spawn_managed_agent(agent_config, &config, &llm_client, state_tx.clone()) {
+            match spawn_managed_agent(agent_config, &current_config, state_tx.clone()) {
               Ok(mut internal) => {
                 internal.state.restart_count = restart_count + 1;
                 info!(agent = %name, restart = internal.state.restart_count, "agent restarted");
-
                 sync_agent_to_shared(&shared_state, &name, &internal).await;
                 managed.insert(name, internal);
               }
@@ -273,9 +267,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
     info!(agent = %name, "sent stop to agent");
   }
 
-  // Wait briefly for agents to stop
   tokio::time::sleep(Duration::from_secs(2)).await;
-
   info!("zeptopm stopped");
 }
 
@@ -299,25 +291,48 @@ async fn sync_agent_to_shared(shared: &SharedState, name: &str, internal: &Inter
   );
 }
 
-fn spawn_managed_agent(
+/// Create a zeptoclaw LLMProvider from zeptoPM config.
+fn create_provider(
   agent_config: &crate::config::AgentConfig,
   config: &Config,
-  llm_client: &LlmClient,
-  state_tx: mpsc::Sender<AgentStateUpdate>,
-) -> Result<InternalAgent, String> {
+) -> Result<Arc<dyn LLMProvider>, String> {
   let provider_config = config.providers.get(&agent_config.provider);
   let api_key = provider_config
     .and_then(|p| p.resolve_api_key())
     .ok_or_else(|| format!("no API key for provider '{}'", agent_config.provider))?;
-  let base_url = llm::resolve_base_url(provider_config, &agent_config.provider);
 
-  let (handle, join) = spawn_agent(
-    agent_config.clone(),
-    llm_client.clone(),
-    api_key,
-    base_url,
-    state_tx,
-  );
+  let provider_name = &agent_config.provider;
+  let base_url = provider_config.and_then(|p| p.base_url.clone());
+
+  let provider: Arc<dyn LLMProvider> = match provider_name.as_str() {
+    "anthropic" | "claude" => Arc::new(zeptoclaw::ClaudeProvider::new(&api_key)),
+    "openai" => match base_url {
+      Some(url) => Arc::new(zeptoclaw::OpenAIProvider::with_base_url(&api_key, &url)),
+      None => Arc::new(zeptoclaw::OpenAIProvider::new(&api_key)),
+    },
+    // OpenRouter, Groq, Together, etc. are OpenAI-compatible
+    _ => {
+      let url = base_url.unwrap_or_else(|| match provider_name.as_str() {
+        "openrouter" => "https://openrouter.ai/api/v1".into(),
+        "groq" => "https://api.groq.com/openai/v1".into(),
+        "together" => "https://api.together.xyz/v1".into(),
+        _ => format!("https://{}.api.example.com/v1", provider_name),
+      });
+      Arc::new(zeptoclaw::OpenAIProvider::with_base_url(&api_key, &url))
+    }
+  };
+
+  Ok(provider)
+}
+
+fn spawn_managed_agent(
+  agent_config: &crate::config::AgentConfig,
+  config: &Config,
+  state_tx: mpsc::Sender<AgentStateUpdate>,
+) -> Result<InternalAgent, String> {
+  let provider = create_provider(agent_config, config)?;
+
+  let (handle, join) = spawn_agent(agent_config.clone(), provider, state_tx);
 
   Ok(InternalAgent {
     handle,
@@ -341,7 +356,6 @@ async fn apply_config_changes(
   managed: &mut HashMap<String, InternalAgent>,
   shared_state: &SharedState,
   new_config: &Config,
-  llm_client: &LlmClient,
   state_tx: mpsc::Sender<AgentStateUpdate>,
 ) {
   let running_names: std::collections::HashSet<String> =
@@ -374,7 +388,7 @@ async fn apply_config_changes(
     if managed.contains_key(&agent_config.name) {
       continue;
     }
-    match spawn_managed_agent(agent_config, new_config, llm_client, state_tx.clone()) {
+    match spawn_managed_agent(agent_config, new_config, state_tx.clone()) {
       Ok(internal) => {
         info!(agent = %agent_config.name, "added agent (config change)");
         sync_agent_to_shared(shared_state, &agent_config.name, &internal).await;

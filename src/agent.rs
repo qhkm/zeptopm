@@ -1,11 +1,15 @@
 //! Agent process management — spawn, monitor, restart.
+//!
+//! Each agent runs as a tokio task wrapping a zeptoclaw ZeptoAgent
+//! for full conversation history, tool calling, and provider support.
 
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+use zeptoclaw::providers::LLMProvider;
 
 use crate::config::AgentConfig;
-use crate::llm::LlmClient;
 
 /// Runtime state of a managed agent.
 #[derive(Debug, Clone)]
@@ -86,12 +90,10 @@ impl AgentHandle {
   }
 }
 
-/// Spawn an agent as a tokio task. Returns a handle and a join handle.
+/// Spawn an agent as a tokio task backed by a zeptoclaw ZeptoAgent.
 pub fn spawn_agent(
   config: AgentConfig,
-  llm_client: LlmClient,
-  api_key: String,
-  base_url: String,
+  provider: Arc<dyn LLMProvider>,
   state_tx: mpsc::Sender<AgentStateUpdate>,
 ) -> (AgentHandle, tokio::task::JoinHandle<()>) {
   let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCommand>(64);
@@ -102,7 +104,7 @@ pub fn spawn_agent(
     cmd_tx,
   };
 
-  let join = tokio::spawn(agent_loop(config, llm_client, api_key, base_url, cmd_rx, state_tx));
+  let join = tokio::spawn(agent_loop(config, provider, cmd_rx, state_tx));
 
   (handle, join)
 }
@@ -118,16 +120,44 @@ pub struct AgentStateUpdate {
 
 async fn agent_loop(
   config: AgentConfig,
-  client: LlmClient,
-  api_key: String,
-  base_url: String,
+  provider: Arc<dyn LLMProvider>,
   mut cmd_rx: mpsc::Receiver<AgentCommand>,
   state_tx: mpsc::Sender<AgentStateUpdate>,
 ) {
   let name = config.name.clone();
-  let model = config.model.as_deref().unwrap_or("openai/gpt-4o-mini");
+  let model = config.model.clone();
 
-  info!(agent = %name, model = %model, "agent process started");
+  // Build ZeptoAgent with conversation history
+  let mut builder = zeptoclaw::ZeptoAgentBuilder::new().provider_arc(provider);
+
+  if let Some(ref prompt) = config.system_prompt {
+    builder = builder.system_prompt(prompt);
+  }
+  if let Some(ref m) = model {
+    builder = builder.model(m);
+  }
+  if let Some(max_iter) = config.max_iterations {
+    builder = builder.max_iterations(max_iter);
+  }
+
+  let agent = match builder.build() {
+    Ok(a) => a,
+    Err(e) => {
+      warn!(agent = %name, error = %e, "failed to build ZeptoAgent");
+      let _ = state_tx
+        .send(AgentStateUpdate {
+          name: name.clone(),
+          status: AgentStatus::Error,
+          error: Some(format!("build failed: {}", e)),
+          tokens_delta: 0,
+        })
+        .await;
+      return;
+    }
+  };
+
+  let display_model = model.as_deref().unwrap_or("default");
+  info!(agent = %name, model = %display_model, "agent process started (zeptoclaw)");
 
   let _ = state_tx
     .send(AgentStateUpdate {
@@ -152,21 +182,13 @@ async fn agent_loop(
           })
           .await;
 
-        match client
-          .chat(&base_url, &api_key, model, config.system_prompt.as_deref(), &msg)
-          .await
-        {
+        match agent.chat(&msg).await {
           Ok(response) => {
-            let tokens = response.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
-            info!(
-              agent = %name,
-              tokens = tokens,
-              "LLM response received"
-            );
-            debug!(agent = %name, content = %response.content, "response content");
+            info!(agent = %name, "response received");
+            debug!(agent = %name, content = %response, "response content");
 
             if let Some(tx) = resp_tx {
-              let _ = tx.send(Ok(response.content.clone()));
+              let _ = tx.send(Ok(response));
             }
 
             let _ = state_tx
@@ -174,12 +196,12 @@ async fn agent_loop(
                 name: name.clone(),
                 status: AgentStatus::Idle,
                 error: None,
-                tokens_delta: tokens,
+                tokens_delta: 0,
               })
               .await;
           }
           Err(e) => {
-            warn!(agent = %name, error = %e, "LLM call failed");
+            warn!(agent = %name, error = %e, "agent chat failed");
 
             if let Some(tx) = resp_tx {
               let _ = tx.send(Err(e.to_string()));
