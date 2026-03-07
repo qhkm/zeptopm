@@ -176,7 +176,6 @@ pub async fn run(agent_name: String, config_path: String) {
               "path": artifact_path,
               "summary": response.chars().take(200).collect::<String>()
             }));
-
             send(&serde_json::json!({
               "type": "job_completed",
               "job_id": job_id,

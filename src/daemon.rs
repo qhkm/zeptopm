@@ -228,7 +228,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
             while let Some(job) = orchestrator.next_job() {
               info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
               orchestrator.mark_running(&job.job_id);
-              spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state).await;
+              spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
             }
 
             let _ = reply.send(Ok(run_id));
@@ -249,19 +249,56 @@ pub async fn run(config_path: String, bind: Option<String>) {
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match event_type {
           "job_completed" => {
-            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let artifacts: Vec<String> = event.get("output_artifact_ids")
               .and_then(|v| v.as_array())
               .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
               .unwrap_or_default();
-            orchestrator.mark_completed(job_id, artifacts);
+
+            // Check if completed job is a planner — if so, materialize the plan
+            let is_planner = orchestrator.store.get_job(&job_id)
+              .map(|j| j.role == "planner")
+              .unwrap_or(false);
+            let run_id = orchestrator.store.get_job(&job_id)
+              .map(|j| j.run_id.clone())
+              .unwrap_or_default();
+
+            orchestrator.mark_completed(&job_id, artifacts.clone());
             info!(job_id = %job_id, "job completed");
+
+            if is_planner {
+              // Read planner output and try to parse as ExecutionPlan
+              if let Some(artifact) = artifacts.first().and_then(|aid| orchestrator.store.get_artifact(aid)) {
+                let plan_text = std::fs::read_to_string(&artifact.path).unwrap_or_default();
+                // Try to extract JSON from the response (may be wrapped in markdown)
+                let json_str = extract_json(&plan_text);
+                match serde_json::from_str::<crate::orchestrator::types::ExecutionPlan>(&json_str) {
+                  Ok(plan) => {
+                    info!(run_id = %run_id, jobs = plan.jobs.len(), "planner produced execution plan");
+                    let new_job_ids = crate::orchestrator::planner::materialize_plan(
+                      &mut orchestrator.store, &run_id, &job_id, &plan
+                    );
+                    // Promote ready jobs to the queue
+                    for jid in &new_job_ids {
+                      if let Some(j) = orchestrator.store.get_job(jid) {
+                        if j.status == crate::orchestrator::types::JobStatus::Ready {
+                          orchestrator.ready_queue.push_back(jid.clone());
+                        }
+                      }
+                    }
+                  }
+                  Err(e) => {
+                    warn!(run_id = %run_id, error = %e, "failed to parse planner output as ExecutionPlan");
+                  }
+                }
+              }
+            }
 
             // Spawn newly ready jobs
             while let Some(job) = orchestrator.next_job() {
               info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
               orchestrator.mark_running(&job.job_id);
-              spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state).await;
+              spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
             }
           }
           "job_failed" => {
@@ -274,7 +311,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
             while let Some(job) = orchestrator.next_job() {
               info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry)");
               orchestrator.mark_running(&job.job_id);
-              spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state).await;
+              spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
             }
           }
           "artifact_produced" => {
@@ -287,7 +324,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
               run_id,
               job_id: job_id.into(),
               kind: event.get("kind").and_then(|v| v.as_str()).unwrap_or("").into(),
-              path: event.get("path").and_then(|v| v.as_str()).unwrap_or("").into(),
+              path: std::path::PathBuf::from(event.get("path").and_then(|v| v.as_str()).unwrap_or("")),
               summary: event.get("summary").and_then(|v| v.as_str()).unwrap_or("").into(),
               created_at: std::time::SystemTime::now(),
             };
@@ -476,6 +513,7 @@ async fn spawn_job_worker(
   orch_event_tx: mpsc::Sender<serde_json::Value>,
   _managed: &mut HashMap<String, InternalAgent>,
   _shared_state: &SharedState,
+  orchestrator_store: &crate::orchestrator::store::RunStore,
 ) {
   // Find an agent config matching the job's role/profile_id
   let agent_config = match config.agents.iter().find(|a| a.name == job.profile_id) {
@@ -493,16 +531,49 @@ async fn spawn_job_worker(
   };
 
   // Spawn a worker using the matching agent profile
-  let (handle, _join) = crate::agent::spawn_agent_with_orch(
+  let (handle, join) = crate::agent::spawn_agent_with_orch(
     &agent_config.name,
     config_path,
     state_tx.clone(),
     Some(orch_event_tx.clone()),
   );
 
-  // Send the job instruction via the worker's chat command
-  // The worker will process it and emit job_completed/job_failed events via orch_event_tx
-  let _ = handle.send_message(job.instruction.clone()).await;
+  // Collect input artifact paths from completed dependencies
+  let input_artifacts: Vec<String> = job.input_artifact_ids.iter()
+    .filter_map(|aid| orchestrator_store.get_artifact(aid))
+    .map(|a| a.path.to_string_lossy().to_string())
+    .collect();
+
+  // Send job_execute command — the worker will emit job_completed/job_failed events
+  let _ = handle.send_job(
+    job.job_id.clone(),
+    job.instruction.clone(),
+    job.workspace_dir.to_string_lossy().to_string(),
+    input_artifacts,
+  ).await;
+
+  // Store the handle to keep the bridge alive until the job completes.
+  // Using a unique name to avoid collisions with regular agents.
+  let worker_name = format!("__job_{}", job.job_id);
+  _managed.insert(worker_name, InternalAgent {
+    handle,
+    _join: join,
+    state: AgentState {
+      name: job.job_id.clone(),
+      status: AgentStatus::Running,
+      restart_count: 0,
+      started_at: Some(Instant::now()),
+      last_error: None,
+      messages_handled: 0,
+      tokens_used: 0,
+      logs: vec![],
+      pid: None,
+    },
+    max_restarts: 0,
+    restart_backoff_ms: 1000,
+    restart_at: None,
+    gateway: None,
+  });
 }
 
 fn get_run_status_data(
@@ -530,6 +601,31 @@ fn get_run_status_data(
     "status": format!("{:?}", run.status),
     "jobs": job_infos,
   }))
+}
+
+/// Extract JSON from text that may be wrapped in markdown code blocks.
+fn extract_json(text: &str) -> String {
+  let trimmed = text.trim();
+  // Try to find JSON block in markdown
+  if let Some(start) = trimmed.find("```json") {
+    let after = &trimmed[start + 7..];
+    if let Some(end) = after.find("```") {
+      return after[..end].trim().to_string();
+    }
+  }
+  if let Some(start) = trimmed.find("```") {
+    let after = &trimmed[start + 3..];
+    if let Some(end) = after.find("```") {
+      return after[..end].trim().to_string();
+    }
+  }
+  // Try to find raw JSON object
+  if let Some(start) = trimmed.find('{') {
+    if let Some(end) = trimmed.rfind('}') {
+      return trimmed[start..=end].to_string();
+    }
+  }
+  trimmed.to_string()
 }
 
 fn get_runs_list_data(orchestrator: &OrchestratorEngine) -> serde_json::Value {

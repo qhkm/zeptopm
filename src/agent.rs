@@ -77,6 +77,13 @@ pub enum AgentCommand {
   /// Send a user message to the agent for LLM processing.
   /// The optional sender receives the LLM response content.
   UserMessage(String, Option<tokio::sync::oneshot::Sender<Result<String, String>>>),
+  /// Execute a job (orchestrator workflow).
+  JobExecute {
+    job_id: String,
+    instruction: String,
+    workspace: String,
+    input_artifacts: Vec<String>,
+  },
   /// Stop the agent gracefully.
   Stop,
 }
@@ -107,6 +114,25 @@ impl AgentHandle {
     resp_rx
       .await
       .map_err(|_| format!("agent '{}' response channel dropped", self.name))?
+  }
+
+  /// Send a job_execute command to the agent.
+  pub async fn send_job(
+    &self,
+    job_id: String,
+    instruction: String,
+    workspace: String,
+    input_artifacts: Vec<String>,
+  ) -> Result<(), String> {
+    self.cmd_tx
+      .send(AgentCommand::JobExecute {
+        job_id,
+        instruction,
+        workspace,
+        input_artifacts,
+      })
+      .await
+      .map_err(|_| format!("agent '{}' channel closed", self.name))
   }
 
   /// Stop the agent.
@@ -280,6 +306,21 @@ async fn worker_bridge(
             let line = format!("{}\n", cmd_json);
             if stdin_writer.write_all(line.as_bytes()).await.is_err() {
               warn!(agent = %agent_name, "failed to write to worker stdin");
+              break;
+            }
+            let _ = stdin_writer.flush().await;
+          }
+          Some(AgentCommand::JobExecute { job_id, instruction, workspace, input_artifacts }) => {
+            let cmd_json = serde_json::json!({
+              "cmd": "job_execute",
+              "job_id": job_id,
+              "instruction": instruction,
+              "workspace": workspace,
+              "input_artifacts": input_artifacts
+            });
+            let line = format!("{}\n", cmd_json);
+            if stdin_writer.write_all(line.as_bytes()).await.is_err() {
+              warn!(agent = %agent_name, "failed to write job_execute to worker stdin");
               break;
             }
             let _ = stdin_writer.flush().await;
