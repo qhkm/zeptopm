@@ -59,6 +59,7 @@ mod tests {
       messages_handled: 5,
       tokens_used: 1234,
       logs: vec![],
+      pid: None,
     };
     let output = format_status_table(&[&state]);
     assert!(output.contains("researcher"));

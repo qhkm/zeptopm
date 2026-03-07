@@ -26,6 +26,8 @@ pub struct DaemonConfig {
   pub log_format: String,
   #[serde(default)]
   pub bind: Option<String>,
+  #[serde(default)]
+  pub sessions_dir: Option<String>,
 }
 
 impl Default for DaemonConfig {
@@ -35,6 +37,7 @@ impl Default for DaemonConfig {
       log_level: default_log_level(),
       log_format: default_log_format(),
       bind: None,
+      sessions_dir: None,
     }
   }
 }
@@ -60,6 +63,8 @@ pub struct AgentConfig {
   pub budget: Option<BudgetConfig>,
   #[serde(default)]
   pub gateway: Option<GatewayConfig>,
+  #[serde(default = "default_true")]
+  pub session_persist: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,6 +196,31 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Resolve the sessions directory path.
+/// Uses `daemon.sessions_dir` if set, otherwise `~/.zeptopm/sessions`.
+pub fn resolve_sessions_dir(config: &Config) -> std::path::PathBuf {
+  if let Some(ref dir) = config.daemon.sessions_dir {
+    let expanded = if dir.starts_with('~') {
+      dirs::home_dir()
+        .map(|h| h.join(dir.trim_start_matches("~/")))
+        .unwrap_or_else(|| std::path::PathBuf::from(dir))
+    } else {
+      std::path::PathBuf::from(dir)
+    };
+    expanded
+  } else {
+    dirs::home_dir()
+      .unwrap_or_else(|| std::path::PathBuf::from("."))
+      .join(".zeptopm")
+      .join("sessions")
+  }
+}
+
+/// Get the session file path for a given agent.
+pub fn session_file(config: &Config, agent_name: &str) -> std::path::PathBuf {
+  resolve_sessions_dir(config).join(format!("{}.json", agent_name))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -265,6 +295,7 @@ mod tests {
         timeout_ms: None,
         budget: None,
         gateway: None,
+        session_persist: true,
       }],
       providers: HashMap::new(),
     };
@@ -288,6 +319,7 @@ mod tests {
       timeout_ms: None,
       budget: None,
       gateway: None,
+      session_persist: true,
     };
     let config = Config {
       daemon: DaemonConfig::default(),

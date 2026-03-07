@@ -75,6 +75,16 @@ enum Commands {
     /// Task for the manager
     message: String,
   },
+  /// Internal: run a single agent as a worker process
+  #[command(hide = true)]
+  Worker {
+    /// Agent name
+    #[arg(long)]
+    agent: String,
+    /// Config file path
+    #[arg(long)]
+    config: String,
+  },
 }
 
 fn init_tracing(level: &str, format: &str) {
@@ -343,6 +353,9 @@ async fn main() {
           std::process::exit(1);
         }
       }
+    }
+    Some(Commands::Worker { agent, config }) => {
+      zeptopm::worker::run(agent, config).await;
     }
     Some(Commands::Logs { name }) => {
       match http_get(&cli.addr, &format!("/agents/{}/logs", name)).await {

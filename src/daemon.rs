@@ -3,11 +3,9 @@
 //! Manages agent lifecycle: spawn, monitor, restart, hot-reload config.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-use zeptoclaw::providers::LLMProvider;
 
 use crate::agent::{
   push_log, spawn_agent, AgentHandle, AgentState, AgentStateUpdate, AgentStatus,
@@ -55,7 +53,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
     if !agent_config.auto_start {
       continue;
     }
-    match spawn_managed_agent(agent_config, &config, state_tx.clone()) {
+    match spawn_managed_agent(agent_config, &config_path, &config, state_tx.clone()) {
       Ok(internal) => {
         info!(agent = %agent_config.name, "agent spawned");
         sync_agent_to_shared(&shared_state, &agent_config.name, &internal).await;
@@ -124,6 +122,9 @@ pub async fn run(config_path: String, bind: Option<String>) {
           if update.error.is_some() {
             internal.state.last_error = update.error;
           }
+          if update.pid.is_some() {
+            internal.state.pid = update.pid;
+          }
           if let Some(log_entry) = update.log {
             push_log(&mut internal.state.logs, log_entry);
           }
@@ -171,7 +172,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
 
             match current_config.agents.iter().find(|a| a.name == name) {
               Some(agent_config) => {
-                match spawn_managed_agent(agent_config, &current_config, state_tx.clone()) {
+                match spawn_managed_agent(agent_config, &config_path, &current_config, state_tx.clone()) {
                   Ok(internal) => {
                     info!(agent = %name, "agent started via command");
                     sync_agent_to_shared(&shared_state, &name, &internal).await;
@@ -197,7 +198,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
 
             match current_config.agents.iter().find(|a| a.name == name) {
               Some(agent_config) => {
-                match spawn_managed_agent(agent_config, &current_config, state_tx.clone()) {
+                match spawn_managed_agent(agent_config, &config_path, &current_config, state_tx.clone()) {
                   Ok(internal) => {
                     info!(agent = %name, "agent restarted via command");
                     sync_agent_to_shared(&shared_state, &name, &internal).await;
@@ -224,7 +225,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
           let new_hash = config::config_hash(&new_config);
           if new_hash != last_config_hash {
             info!(old_hash = last_config_hash, new_hash = new_hash, "config change detected");
-            apply_config_changes(&mut managed, &shared_state, &new_config, state_tx.clone()).await;
+            apply_config_changes(&mut managed, &shared_state, &new_config, &config_path, state_tx.clone()).await;
             current_config = new_config;
             last_config_hash = new_hash;
           }
@@ -246,7 +247,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
             let restart_count = managed.get(&name).map(|m| m.state.restart_count).unwrap_or(0);
             managed.remove(&name);
 
-            match spawn_managed_agent(agent_config, &current_config, state_tx.clone()) {
+            match spawn_managed_agent(agent_config, &config_path, &current_config, state_tx.clone()) {
               Ok(mut internal) => {
                 internal.state.restart_count = restart_count + 1;
                 info!(agent = %name, restart = internal.state.restart_count, "agent restarted");
@@ -296,48 +297,13 @@ async fn sync_agent_to_shared(shared: &SharedState, name: &str, internal: &Inter
   );
 }
 
-/// Create a zeptoclaw LLMProvider from zeptoPM config.
-fn create_provider(
-  agent_config: &crate::config::AgentConfig,
-  config: &Config,
-) -> Result<Arc<dyn LLMProvider>, String> {
-  let provider_config = config.providers.get(&agent_config.provider);
-  let api_key = provider_config
-    .and_then(|p| p.resolve_api_key())
-    .ok_or_else(|| format!("no API key for provider '{}'", agent_config.provider))?;
-
-  let provider_name = &agent_config.provider;
-  let base_url = provider_config.and_then(|p| p.base_url.clone());
-
-  let provider: Arc<dyn LLMProvider> = match provider_name.as_str() {
-    "anthropic" | "claude" => Arc::new(zeptoclaw::ClaudeProvider::new(&api_key)),
-    "openai" => match base_url {
-      Some(url) => Arc::new(zeptoclaw::OpenAIProvider::with_base_url(&api_key, &url)),
-      None => Arc::new(zeptoclaw::OpenAIProvider::new(&api_key)),
-    },
-    // OpenRouter, Groq, Together, etc. are OpenAI-compatible
-    _ => {
-      let url = base_url.unwrap_or_else(|| match provider_name.as_str() {
-        "openrouter" => "https://openrouter.ai/api/v1".into(),
-        "groq" => "https://api.groq.com/openai/v1".into(),
-        "together" => "https://api.together.xyz/v1".into(),
-        _ => format!("https://{}.api.example.com/v1", provider_name),
-      });
-      Arc::new(zeptoclaw::OpenAIProvider::with_base_url(&api_key, &url))
-    }
-  };
-
-  Ok(provider)
-}
-
 fn spawn_managed_agent(
   agent_config: &crate::config::AgentConfig,
-  config: &Config,
+  config_path: &str,
+  _config: &Config,
   state_tx: mpsc::Sender<AgentStateUpdate>,
 ) -> Result<InternalAgent, String> {
-  let provider = create_provider(agent_config, config)?;
-
-  let (handle, join) = spawn_agent(agent_config.clone(), provider, state_tx);
+  let (handle, join) = spawn_agent(&agent_config.name, config_path, state_tx);
 
   let gateway = agent_config.gateway.as_ref().map(|gw| ResolvedGatewayConfig {
     enabled: gw.enabled,
@@ -357,6 +323,7 @@ fn spawn_managed_agent(
       messages_handled: 0,
       tokens_used: 0,
       logs: vec![],
+      pid: None,
     },
     max_restarts: agent_config.max_restarts,
     restart_backoff_ms: agent_config.restart_backoff_ms,
@@ -369,6 +336,7 @@ async fn apply_config_changes(
   managed: &mut HashMap<String, InternalAgent>,
   shared_state: &SharedState,
   new_config: &Config,
+  config_path: &str,
   state_tx: mpsc::Sender<AgentStateUpdate>,
 ) {
   let running_names: std::collections::HashSet<String> =
@@ -401,7 +369,7 @@ async fn apply_config_changes(
     if managed.contains_key(&agent_config.name) {
       continue;
     }
-    match spawn_managed_agent(agent_config, new_config, state_tx.clone()) {
+    match spawn_managed_agent(agent_config, config_path, new_config, state_tx.clone()) {
       Ok(internal) => {
         info!(agent = %agent_config.name, "added agent (config change)");
         sync_agent_to_shared(shared_state, &agent_config.name, &internal).await;

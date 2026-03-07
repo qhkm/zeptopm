@@ -3745,8 +3745,6 @@ dependencies = [
 [[package]]
 name = "zeptoclaw"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1852b42c15130c82ec42d86979233b6228812e2e8b9dabe278936b647c84c62e"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3793,6 +3791,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "dirs",
  "reqwest",
  "serde",
  "serde_json",

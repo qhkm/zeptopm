@@ -117,6 +117,7 @@ struct AgentInfo {
   messages_handled: u64,
   uptime_secs: Option<u64>,
   last_error: Option<String>,
+  pid: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -154,6 +155,7 @@ fn agent_to_info(name: &str, state: &AgentState) -> AgentInfo {
     messages_handled: state.messages_handled,
     uptime_secs: state.started_at.map(|t| t.elapsed().as_secs()),
     last_error: state.last_error.clone(),
+    pid: state.pid,
   }
 }
 

@@ -1,15 +1,13 @@
 //! Agent process management — spawn, monitor, restart.
 //!
-//! Each agent runs as a tokio task wrapping a zeptoclaw ZeptoAgent
-//! for full conversation history, tool calling, and provider support.
+//! Each agent runs as a separate OS process (`zeptopm worker`),
+//! communicating with the supervisor via JSON lines over stdin/stdout.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::Instant;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
-use zeptoclaw::providers::LLMProvider;
-
-use crate::config::AgentConfig;
 
 /// Runtime state of a managed agent.
 #[derive(Debug, Clone)]
@@ -22,6 +20,7 @@ pub struct AgentState {
   pub messages_handled: u64,
   pub tokens_used: u64,
   pub logs: Vec<LogEntry>,
+  pub pid: Option<u32>,
 }
 
 /// A single log entry for an agent.
@@ -116,26 +115,7 @@ impl AgentHandle {
   }
 }
 
-/// Spawn an agent as a tokio task backed by a zeptoclaw ZeptoAgent.
-pub fn spawn_agent(
-  config: AgentConfig,
-  provider: Arc<dyn LLMProvider>,
-  state_tx: mpsc::Sender<AgentStateUpdate>,
-) -> (AgentHandle, tokio::task::JoinHandle<()>) {
-  let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCommand>(64);
-  let name = config.name.clone();
-
-  let handle = AgentHandle {
-    name: name.clone(),
-    cmd_tx,
-  };
-
-  let join = tokio::spawn(agent_loop(config, provider, cmd_rx, state_tx));
-
-  (handle, join)
-}
-
-/// State update sent from agent process to daemon.
+/// State update sent from worker bridge to daemon.
 #[derive(Debug)]
 pub struct AgentStateUpdate {
   pub name: String,
@@ -143,135 +123,286 @@ pub struct AgentStateUpdate {
   pub error: Option<String>,
   pub tokens_delta: u64,
   pub log: Option<LogEntry>,
+  pub pid: Option<u32>,
 }
 
-async fn agent_loop(
-  config: AgentConfig,
-  provider: Arc<dyn LLMProvider>,
+/// Spawn an agent as a separate OS process (`zeptopm worker`).
+pub fn spawn_agent(
+  agent_name: &str,
+  config_path: &str,
+  state_tx: mpsc::Sender<AgentStateUpdate>,
+) -> (AgentHandle, tokio::task::JoinHandle<()>) {
+  let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCommand>(64);
+
+  let handle = AgentHandle {
+    name: agent_name.to_string(),
+    cmd_tx,
+  };
+
+  let join = tokio::spawn(worker_bridge(
+    agent_name.to_string(),
+    config_path.to_string(),
+    cmd_rx,
+    state_tx,
+  ));
+
+  (handle, join)
+}
+
+/// Bridge between the in-process mpsc channel and a child worker process.
+/// Translates AgentCommands to JSON stdin, and JSON stdout back to state updates.
+async fn worker_bridge(
+  agent_name: String,
+  config_path: String,
   mut cmd_rx: mpsc::Receiver<AgentCommand>,
   state_tx: mpsc::Sender<AgentStateUpdate>,
 ) {
-  let name = config.name.clone();
-  let model = config.model.clone();
-
-  // Build ZeptoAgent with conversation history
-  let mut builder = zeptoclaw::ZeptoAgentBuilder::new().provider_arc(provider);
-
-  if let Some(ref prompt) = config.system_prompt {
-    builder = builder.system_prompt(prompt);
-  }
-  if let Some(ref m) = model {
-    builder = builder.model(m);
-  }
-  if let Some(max_iter) = config.max_iterations {
-    builder = builder.max_iterations(max_iter);
-  }
-
-  let agent = match builder.build() {
-    Ok(a) => a,
+  let exe = match std::env::current_exe() {
+    Ok(e) => e,
     Err(e) => {
-      warn!(agent = %name, error = %e, "failed to build ZeptoAgent");
+      warn!(agent = %agent_name, error = %e, "failed to get current executable path");
       let _ = state_tx
         .send(AgentStateUpdate {
-          name: name.clone(),
+          name: agent_name,
           status: AgentStatus::Error,
-          error: Some(format!("build failed: {}", e)),
+          error: Some(format!("cannot find executable: {}", e)),
           tokens_delta: 0,
-          log: Some(make_log("error", &format!("build failed: {}", e))),
+          log: Some(make_log("error", &format!("cannot find executable: {}", e))),
+          pid: None,
         })
         .await;
       return;
     }
   };
 
-  let display_model = model.as_deref().unwrap_or("default");
-  info!(agent = %name, model = %display_model, "agent process started (zeptoclaw)");
+  // Canonicalize config path so the worker resolves it correctly
+  let abs_config = std::fs::canonicalize(&config_path)
+    .unwrap_or_else(|_| std::path::PathBuf::from(&config_path));
+
+  let mut child = match tokio::process::Command::new(&exe)
+    .arg("worker")
+    .arg("--agent")
+    .arg(&agent_name)
+    .arg("--config")
+    .arg(&abs_config)
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::inherit())
+    .spawn()
+  {
+    Ok(c) => c,
+    Err(e) => {
+      warn!(agent = %agent_name, error = %e, "failed to spawn worker process");
+      let _ = state_tx
+        .send(AgentStateUpdate {
+          name: agent_name,
+          status: AgentStatus::Error,
+          error: Some(format!("spawn failed: {}", e)),
+          tokens_delta: 0,
+          log: Some(make_log("error", &format!("spawn failed: {}", e))),
+          pid: None,
+        })
+        .await;
+      return;
+    }
+  };
+
+  let child_pid = child.id();
+  info!(agent = %agent_name, pid = ?child_pid, "worker process spawned");
 
   let _ = state_tx
     .send(AgentStateUpdate {
-      name: name.clone(),
-      status: AgentStatus::Idle,
+      name: agent_name.clone(),
+      status: AgentStatus::Starting,
       error: None,
       tokens_delta: 0,
-      log: Some(make_log("info", &format!("agent started (model={})", display_model))),
+      log: Some(make_log("info", &format!("worker spawned (pid={})", child_pid.unwrap_or(0)))),
+      pid: child_pid,
     })
     .await;
 
-  loop {
-    match cmd_rx.recv().await {
-      Some(AgentCommand::UserMessage(msg, resp_tx)) => {
-        debug!(agent = %name, "processing user message");
+  let child_stdin = child.stdin.take().expect("child stdin");
+  let child_stdout = child.stdout.take().expect("child stdout");
 
-        let _ = state_tx
-          .send(AgentStateUpdate {
-            name: name.clone(),
-            status: AgentStatus::Running,
-            error: None,
-            tokens_delta: 0,
-            log: Some(make_log("info", "processing message")),
-          })
-          .await;
+  let mut stdin_writer = BufWriter::new(child_stdin);
+  let stdout_reader = BufReader::new(child_stdout);
 
-        match agent.chat(&msg).await {
-          Ok(response) => {
-            info!(agent = %name, "response received");
-            debug!(agent = %name, content = %response, "response content");
-
-            if let Some(tx) = resp_tx {
-              let _ = tx.send(Ok(response));
-            }
-
-            let _ = state_tx
-              .send(AgentStateUpdate {
-                name: name.clone(),
-                status: AgentStatus::Idle,
-                error: None,
-                tokens_delta: 0,
-                log: Some(make_log("info", "response delivered")),
-              })
-              .await;
+  // Background task: read stdout lines from worker
+  let (msg_tx, mut msg_rx) = mpsc::channel::<serde_json::Value>(64);
+  let reader_name = agent_name.clone();
+  tokio::spawn(async move {
+    let mut lines = stdout_reader.lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+      match serde_json::from_str::<serde_json::Value>(&line) {
+        Ok(msg) => {
+          if msg_tx.send(msg).await.is_err() {
+            break;
           }
-          Err(e) => {
-            warn!(agent = %name, error = %e, "agent chat failed");
+        }
+        Err(e) => {
+          debug!(agent = %reader_name, error = %e, line = %line, "invalid worker output");
+        }
+      }
+    }
+  });
+
+  // Pending chat requests: id -> oneshot sender
+  let mut pending: HashMap<String, tokio::sync::oneshot::Sender<Result<String, String>>> =
+    HashMap::new();
+  let mut req_counter: u64 = 0;
+
+  loop {
+    tokio::select! {
+      // Commands from the daemon/server
+      cmd = cmd_rx.recv() => {
+        match cmd {
+          Some(AgentCommand::UserMessage(msg, resp_tx)) => {
+            req_counter += 1;
+            let id = format!("req-{}", req_counter);
 
             if let Some(tx) = resp_tx {
-              let _ = tx.send(Err(e.to_string()));
+              pending.insert(id.clone(), tx);
             }
 
-            let _ = state_tx
-              .send(AgentStateUpdate {
-                name: name.clone(),
-                status: AgentStatus::Error,
-                error: Some(e.to_string()),
-                tokens_delta: 0,
-                log: Some(make_log("error", &format!("chat failed: {}", e))),
-              })
-              .await;
+            let cmd_json = serde_json::json!({"cmd":"chat","id":id,"message":msg});
+            let line = format!("{}\n", cmd_json);
+            if stdin_writer.write_all(line.as_bytes()).await.is_err() {
+              warn!(agent = %agent_name, "failed to write to worker stdin");
+              break;
+            }
+            let _ = stdin_writer.flush().await;
+          }
+          Some(AgentCommand::Stop) => {
+            let cmd_json = serde_json::json!({"cmd":"stop"});
+            let line = format!("{}\n", cmd_json);
+            let _ = stdin_writer.write_all(line.as_bytes()).await;
+            let _ = stdin_writer.flush().await;
+            // Don't break yet — wait for the worker to send "stopped" status
+          }
+          None => {
+            // Command channel closed — supervisor is shutting down
+            break;
           }
         }
       }
-      Some(AgentCommand::Stop) => {
-        info!(agent = %name, "stop command received");
-        break;
+
+      // Messages from the worker process
+      msg = msg_rx.recv() => {
+        match msg {
+          Some(msg) => {
+            let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+            match msg_type {
+              "ready" => {
+                debug!(agent = %agent_name, "worker ready");
+              }
+              "chat_response" => {
+                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if let Some(tx) = pending.remove(&id) {
+                  if let Some(error) = msg.get("error").and_then(|v| v.as_str()) {
+                    let _ = tx.send(Err(error.to_string()));
+                  } else {
+                    let response = msg.get("response").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let _ = tx.send(Ok(response));
+                  }
+                }
+              }
+              "status" => {
+                let status_str = msg.get("status").and_then(|v| v.as_str()).unwrap_or("idle");
+                let error = msg.get("error").and_then(|v| v.as_str()).map(String::from);
+                let status = match status_str {
+                  "idle" => AgentStatus::Idle,
+                  "running" => AgentStatus::Running,
+                  "error" => AgentStatus::Error,
+                  "stopped" => AgentStatus::Stopped,
+                  _ => AgentStatus::Idle,
+                };
+
+                let is_stopped = status == AgentStatus::Stopped;
+
+                let _ = state_tx
+                  .send(AgentStateUpdate {
+                    name: agent_name.clone(),
+                    status,
+                    error,
+                    tokens_delta: 0,
+                    log: None,
+                    pid: child_pid,
+                  })
+                  .await;
+
+                if is_stopped {
+                  break;
+                }
+              }
+              "log" => {
+                let level = msg.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+                let message = msg.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                let _ = state_tx
+                  .send(AgentStateUpdate {
+                    name: agent_name.clone(),
+                    status: AgentStatus::Idle,
+                    error: None,
+                    tokens_delta: 0,
+                    log: Some(make_log(level, message)),
+                    pid: child_pid,
+                  })
+                  .await;
+              }
+              _ => {
+                debug!(agent = %agent_name, msg_type = msg_type, "unknown worker message type");
+              }
+            }
+          }
+          None => {
+            // Worker stdout closed — process exited
+            warn!(agent = %agent_name, "worker process stdout closed");
+            break;
+          }
+        }
       }
-      None => {
-        debug!(agent = %name, "command channel closed");
-        break;
+    }
+  }
+
+  // Fail any pending requests
+  for (_, tx) in pending.drain() {
+    let _ = tx.send(Err(format!("agent '{}' worker process exited", agent_name)));
+  }
+
+  // Wait for child to exit
+  match child.wait().await {
+    Ok(status) => {
+      info!(agent = %agent_name, exit_code = ?status.code(), "worker process exited");
+      if !status.success() {
+        let _ = state_tx
+          .send(AgentStateUpdate {
+            name: agent_name.clone(),
+            status: AgentStatus::Error,
+            error: Some(format!("worker exited with {}", status)),
+            tokens_delta: 0,
+            log: Some(make_log("error", &format!("worker exited with {}", status))),
+            pid: child_pid,
+          })
+          .await;
       }
+    }
+    Err(e) => {
+      warn!(agent = %agent_name, error = %e, "failed to wait for worker");
     }
   }
 
   let _ = state_tx
     .send(AgentStateUpdate {
-      name: name.clone(),
+      name: agent_name.clone(),
       status: AgentStatus::Stopped,
       error: None,
       tokens_delta: 0,
-      log: Some(make_log("info", "agent stopped")),
+      log: Some(make_log("info", "worker process stopped")),
+      pid: child_pid,
     })
     .await;
 
-  info!(agent = %name, "agent process stopped");
+  info!(agent = %agent_name, "worker bridge stopped");
 }
 
 #[cfg(test)]
