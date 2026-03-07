@@ -3,6 +3,10 @@ name = "zeptopm"
 version = "0.1.0"
 edition = "2024"
 description = "Process manager for AI agents — like PM2, but for LLMs"
+license = "MIT"
+repository = "https://github.com/qhkm/zeptopm"
+keywords = ["ai", "agent", "process-manager", "llm", "orchestration"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "zeptopm"

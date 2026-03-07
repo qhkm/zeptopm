@@ -56,6 +56,11 @@ enum Commands {
     /// Agent name
     name: String,
   },
+  /// Show recent logs for an agent
+  Logs {
+    /// Agent name
+    name: String,
+  },
 }
 
 fn init_tracing(level: &str, format: &str) {
@@ -246,6 +251,34 @@ async fn main() {
         }
         Err(e) => {
           eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+          std::process::exit(1);
+        }
+      }
+    }
+    Some(Commands::Logs { name }) => {
+      match http_get(&cli.addr, &format!("/agents/{}/logs", name)).await {
+        Ok(body) => {
+          let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+          if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+            eprintln!("Error: {}", error);
+            std::process::exit(1);
+          }
+          if let Some(logs) = resp.get("logs").and_then(|v| v.as_array()) {
+            if logs.is_empty() {
+              println!("No logs for agent '{}'.", name);
+              return;
+            }
+            for entry in logs {
+              let ts = entry.get("timestamp").and_then(|v| v.as_str()).unwrap_or("?");
+              let level = entry.get("level").and_then(|v| v.as_str()).unwrap_or("?");
+              let msg = entry.get("message").and_then(|v| v.as_str()).unwrap_or("?");
+              println!("{} [{}] {}", ts, level, msg);
+            }
+          }
+        }
+        Err(e) => {
+          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+          eprintln!("Is the daemon running? Start with: zeptopm daemon");
           std::process::exit(1);
         }
       }

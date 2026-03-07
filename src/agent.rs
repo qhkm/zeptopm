@@ -21,6 +21,32 @@ pub struct AgentState {
   pub last_error: Option<String>,
   pub messages_handled: u64,
   pub tokens_used: u64,
+  pub logs: Vec<LogEntry>,
+}
+
+/// A single log entry for an agent.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LogEntry {
+  pub timestamp: String,
+  pub level: String,
+  pub message: String,
+}
+
+pub const MAX_LOG_ENTRIES: usize = 100;
+
+fn make_log(level: &str, message: &str) -> LogEntry {
+  LogEntry {
+    timestamp: chrono::Utc::now().to_rfc3339(),
+    level: level.to_string(),
+    message: message.to_string(),
+  }
+}
+
+pub fn push_log(logs: &mut Vec<LogEntry>, entry: LogEntry) {
+  if logs.len() >= MAX_LOG_ENTRIES {
+    logs.remove(0);
+  }
+  logs.push(entry);
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +142,7 @@ pub struct AgentStateUpdate {
   pub status: AgentStatus,
   pub error: Option<String>,
   pub tokens_delta: u64,
+  pub log: Option<LogEntry>,
 }
 
 async fn agent_loop(
@@ -150,6 +177,7 @@ async fn agent_loop(
           status: AgentStatus::Error,
           error: Some(format!("build failed: {}", e)),
           tokens_delta: 0,
+          log: Some(make_log("error", &format!("build failed: {}", e))),
         })
         .await;
       return;
@@ -165,6 +193,7 @@ async fn agent_loop(
       status: AgentStatus::Idle,
       error: None,
       tokens_delta: 0,
+      log: Some(make_log("info", &format!("agent started (model={})", display_model))),
     })
     .await;
 
@@ -179,6 +208,7 @@ async fn agent_loop(
             status: AgentStatus::Running,
             error: None,
             tokens_delta: 0,
+            log: Some(make_log("info", "processing message")),
           })
           .await;
 
@@ -197,6 +227,7 @@ async fn agent_loop(
                 status: AgentStatus::Idle,
                 error: None,
                 tokens_delta: 0,
+                log: Some(make_log("info", "response delivered")),
               })
               .await;
           }
@@ -213,6 +244,7 @@ async fn agent_loop(
                 status: AgentStatus::Error,
                 error: Some(e.to_string()),
                 tokens_delta: 0,
+                log: Some(make_log("error", &format!("chat failed: {}", e))),
               })
               .await;
           }
@@ -235,6 +267,7 @@ async fn agent_loop(
       status: AgentStatus::Stopped,
       error: None,
       tokens_delta: 0,
+      log: Some(make_log("info", "agent stopped")),
     })
     .await;
 

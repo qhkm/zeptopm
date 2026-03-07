@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::agent::{AgentHandle, AgentState, AgentStatus};
+use crate::agent::{AgentHandle, AgentState, AgentStatus, LogEntry};
 
 /// Commands sent from HTTP handlers to the daemon loop.
 #[derive(Debug)]
@@ -110,6 +110,7 @@ pub fn build_router(state: SharedState) -> Router {
     .route("/agents/{name}/start", post(post_start))
     .route("/agents/{name}/restart", post(post_restart))
     .route("/agents/{name}/status", get(get_agent_status))
+    .route("/agents/{name}/logs", get(get_agent_logs))
     .with_state(state)
 }
 
@@ -130,6 +131,31 @@ async fn get_agent_status(
   let s = state.read().await;
   match s.agents.get(&name) {
     Some(m) => Ok(Json(agent_to_info(&name, &m.state))),
+    None => Err((
+      StatusCode::NOT_FOUND,
+      Json(ErrorResponse {
+        error: format!("agent '{}' not found", name),
+      }),
+    )),
+  }
+}
+
+#[derive(Serialize)]
+struct LogsResponse {
+  agent: String,
+  logs: Vec<LogEntry>,
+}
+
+async fn get_agent_logs(
+  State(state): State<SharedState>,
+  Path(name): Path<String>,
+) -> Result<Json<LogsResponse>, (StatusCode, Json<ErrorResponse>)> {
+  let s = state.read().await;
+  match s.agents.get(&name) {
+    Some(m) => Ok(Json(LogsResponse {
+      agent: name,
+      logs: m.state.logs.clone(),
+    })),
     None => Err((
       StatusCode::NOT_FOUND,
       Json(ErrorResponse {

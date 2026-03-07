@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use zeptoclaw::providers::LLMProvider;
 
 use crate::agent::{
-  spawn_agent, AgentHandle, AgentState, AgentStateUpdate, AgentStatus,
+  push_log, spawn_agent, AgentHandle, AgentState, AgentStateUpdate, AgentStatus,
 };
 use crate::config::{self, Config};
 use crate::server::{self, DaemonCommand, ManagedAgentRef, SharedState};
@@ -123,6 +123,9 @@ pub async fn run(config_path: String, bind: Option<String>) {
           internal.state.status = update.status.clone();
           if update.error.is_some() {
             internal.state.last_error = update.error;
+          }
+          if let Some(log_entry) = update.log {
+            push_log(&mut internal.state.logs, log_entry);
           }
 
           // Sync to shared state for HTTP handlers
@@ -345,6 +348,7 @@ fn spawn_managed_agent(
       last_error: None,
       messages_handled: 0,
       tokens_used: 0,
+      logs: vec![],
     },
     max_restarts: agent_config.max_restarts,
     restart_backoff_ms: agent_config.restart_backoff_ms,
