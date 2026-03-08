@@ -10,7 +10,7 @@
 
 **Stack position:** ZeptoPM (this) → ZeptoKernel (isolation) → ZeptoClaw (worker)
 
-**Current state:** Core PM shipped. Orchestration Phases 1–5 done. 50 tests passing. Zero warnings.
+**Current state:** Core PM shipped. Orchestration Phases 1–6 done. 58 tests passing. Zero warnings.
 
 **Design docs:**
 - `docs/plans/2026-03-08-orchestration-design.md` — architecture decisions
@@ -34,7 +34,7 @@
 | Orch Phase 3: CLI + API | ✅ Done | `run submit/status/list`, `--tail` flag, REST endpoints |
 | Orch Phase 4: Heartbeat | ✅ Done | Progress tracking, stuck job detection (4 tests) |
 | Orch Phase 5: Review loop | ✅ Done | Review parsing, revision re-queueing (11 tests) |
-| SQLite persistence | 🔴 Not started | Survive daemon restarts, audit trail |
+| SQLite persistence | ✅ Done | WAL-mode SQLite, hydration on restart (8 tests) |
 | ZeptoKernel integration | 🔴 Not started | Isolated capsule execution |
 | End-to-end testing | 🔴 Not started | Real daemon + LLM smoke test |
 
@@ -60,6 +60,7 @@
 | `src/orchestrator/scheduler.rs` | ~100 | Dependency promotion, run completion check (7 tests) |
 | `src/orchestrator/engine.rs` | ~470 | OrchestratorEngine: submit_run, next_job, heartbeat, review loop (15 tests) |
 | `src/orchestrator/review.rs` | ~140 | Review decision parsing: JSON + keyword fallback (8 tests) |
+| `src/orchestrator/sqlite_store.rs` | ~350 | SQLite persistence sidecar: persist/load/hydrate (8 tests) |
 | `src/orchestrator/planner.rs` | ~80 | ExecutionPlan → child jobs materializer (2 tests) |
 
 ---
@@ -126,28 +127,22 @@ Replace in-memory RunStore with SQLite so runs survive daemon restarts.
 
 ### Tasks
 
-- [ ] **6.1 — SQLite schema** (`src/orchestrator/sqlite_store.rs`)
-  - Tables: `runs`, `jobs`, `artifacts`
-  - Same interface as RunStore (create/get/update/list methods)
-  - Use `rusqlite` crate
-  - DB path: `~/.zeptopm/zeptopm.db`
-  - **Test:** CRUD tests mirroring existing RunStore tests
+- [x] **6.1 — SQLite schema** (`src/orchestrator/sqlite_store.rs`)
+  - Tables: runs, jobs, artifacts + schema_version
+  - WAL mode, PRAGMA synchronous=NORMAL
+  - 5 CRUD tests + upsert test
 
-- [ ] **6.2 — Migration on startup**
-  - Create tables if not exist on daemon start
-  - Version table for future schema migrations
-  - **Test:** Fresh DB creates schema correctly
+- [x] **6.2 — Migration on startup** (`src/daemon.rs`)
+  - `init_schema()` creates tables if not exist
+  - Schema version table for future migrations
 
-- [ ] **6.3 — Swap RunStore for SqliteStore in engine**
-  - Make engine generic over store trait, or just swap implementation
-  - Existing 35 tests must still pass
-  - **Test:** All engine tests pass with SQLite backend
+- [x] **6.3 — Sidecar persistence in daemon** (`src/daemon.rs`)
+  - Write-through: engine keeps in-memory RunStore, daemon persists to SQLite after each mutation
+  - `persist_run_state()` bulk persists run + all jobs after submit/complete/fail
 
-- [ ] **6.4 — Resume incomplete runs on restart**
-  - On daemon start, scan for Running/Pending runs
-  - Re-queue Ready jobs
-  - Mark Running jobs as failed (process died) — engine retries if attempts remain
-  - **Test:** Simulate crash → restart → verify run resumes
+- [x] **6.4 — Resume incomplete runs on restart** (`src/daemon.rs`)
+  - On startup: hydrate engine from SQLite, re-queue Ready jobs, fail Running jobs (process lost)
+  - Hydration test + resume test in sqlite_store.rs
 
 **Exit criteria:** `kill daemon && zeptopm daemon` — in-progress runs resume. Old runs queryable.
 
@@ -206,7 +201,7 @@ Independent tasks, can be done anytime.
 
 ## Known Issues
 
-1. **In-memory store** — All runs/jobs/artifacts lost on daemon restart. Phase 6 fixes this.
+1. ~~**In-memory store**~~ — Fixed by Phase 6 SQLite persistence.
 2. **No end-to-end test** — Orchestration hasn't been tested with real LLM calls yet. Need test config + API key.
 3. **`test-persist.toml`** — Untracked test artifact in repo root. Should be gitignored or committed.
 4. **Planner fragility** — Planner output must be valid JSON matching ExecutionPlan schema. No validation/retry on malformed plans yet.
@@ -217,7 +212,7 @@ Independent tasks, can be done anytime.
 
 1. **Read this file** — you're doing it
 2. **Read `CLAUDE.md`** — project conventions
-3. **Run `cargo test`** — verify 50 tests pass
-4. **Pick the next unchecked task** — Phase 6 is highest priority
+3. **Run `cargo test`** — verify 58 tests pass
+4. **Pick the next unchecked task** — Phase 7 or Infrastructure tasks
 5. **Implement, test, commit** — one task at a time
 6. **Update this file** — check off completed tasks
