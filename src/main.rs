@@ -189,7 +189,9 @@ async fn main() {
 
       if let Some(name) = cmd_name {
           if let Some(cmd_spec) = manifest["commands"].get(name) {
-              let entry = serde_json::json!({ name: cmd_spec });
+              let mut entry = serde_json::Map::new();
+              entry.insert(name.to_string(), cmd_spec.clone());
+              let entry = serde_json::Value::Object(entry);
               println!("{}", serde_json::to_string_pretty(&entry).unwrap());
           } else {
               println!("{}", serde_json::to_string_pretty(&manifest).unwrap());
@@ -477,7 +479,7 @@ async fn main() {
               match serde_json::from_str::<serde_json::Value>(&resp_body) {
                 Ok(resp) => {
                   if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
-                    Err(CliError { message: error.into(), code: "SUBMIT_FAILED".into() })
+                    Err(CliError::parse_error(error))
                   } else {
                     Ok(resp)
                   }
@@ -801,7 +803,7 @@ fn build_manifest() -> serde_json::Value {
                 "args": [],
                 "flags": ["--json"],
                 "output_shape": {
-                    "agents": [{"name": "str", "status": "str", "restarts": "int", "tokens_used": "int", "uptime_secs": "int"}]
+                    "agents": [{"name": "str", "status": "str", "restart_count": "int", "tokens_used": "int", "uptime_secs": "int"}]
                 }
             },
             "list": {
