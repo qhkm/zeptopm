@@ -21,7 +21,11 @@ use crate::orchestrator::types::Job;
 /// Backend selector for capsule job execution.
 ///
 /// Enum-dispatch avoids trait objects (Backend has an associated Handle type).
-/// Adding Firecracker in M6 = one new variant + one new match arm.
+///
+/// # Adding a new backend (e.g. Firecracker in M6)
+/// 1. Add a variant here with the matching `#[cfg(...)]` gate.
+/// 2. Add a match arm in `CapsuleBackend::run_job`.
+/// 3. Add a match arm in `make_backend`.
 pub enum CapsuleBackend {
     Process(ProcessBackend),
     #[cfg(all(target_os = "linux", feature = "namespace"))]
@@ -53,6 +57,9 @@ pub fn make_backend(config: &crate::config::Config) -> CapsuleBackend {
     match config.daemon.isolation.as_str() {
         #[cfg(all(target_os = "linux", feature = "namespace"))]
         "namespace" => CapsuleBackend::Namespace(NamespaceBackend::new(guest)),
+        // "capsule" is a backward-compat alias for "process"; "none" and unknown values
+        // also produce ProcessBackend (safe default).
+        "process" | "capsule" | "none" => CapsuleBackend::Process(ProcessBackend::new(guest)),
         _ => CapsuleBackend::Process(ProcessBackend::new(guest)),
     }
 }
