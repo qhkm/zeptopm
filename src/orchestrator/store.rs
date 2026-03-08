@@ -64,7 +64,6 @@ impl RunStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestrator::types::*;
     use std::time::SystemTime;
 
     fn make_run() -> Run {

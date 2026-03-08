@@ -402,6 +402,12 @@ async fn worker_bridge(
                   })
                   .await;
               }
+              "heartbeat" | "progress" => {
+                // Forward to orchestrator engine (no state update needed)
+                if let Some(ref orch_tx) = orch_event_tx {
+                  let _ = orch_tx.send(msg.clone()).await;
+                }
+              }
               "artifact_produced" | "job_completed" | "job_failed" => {
                 let _ = state_tx
                   .send(AgentStateUpdate {

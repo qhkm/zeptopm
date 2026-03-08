@@ -248,6 +248,17 @@ pub async fn run(config_path: String, bind: Option<String>) {
       Some(event) = orch_event_rx.recv() => {
         let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match event_type {
+          "heartbeat" => {
+            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+            orchestrator.record_heartbeat(job_id);
+          }
+          "progress" => {
+            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+            orchestrator.record_heartbeat(job_id);
+            let phase = event.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+            let message = event.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            info!(job_id = %job_id, phase = %phase, message = %message, "job progress");
+          }
           "job_completed" => {
             let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let artifacts: Vec<String> = event.get("output_artifact_ids")
@@ -344,6 +355,25 @@ pub async fn run(config_path: String, bind: Option<String>) {
             apply_config_changes(&mut managed, &shared_state, &new_config, &config_path, state_tx.clone()).await;
             current_config = new_config;
             last_config_hash = new_hash;
+          }
+        }
+
+        // Check for stuck orchestrator jobs (no heartbeat for 120s)
+        let stale = orchestrator.stale_jobs(Duration::from_secs(120));
+        for job_id in stale {
+          warn!(job_id = %job_id, "job heartbeat timeout — marking failed");
+          // Kill the worker process
+          let worker_name = format!("__job_{}", job_id);
+          if let Some(internal) = managed.get(&worker_name) {
+            internal.handle.stop().await;
+          }
+          orchestrator.mark_failed(&job_id, "heartbeat timeout".into());
+
+          // Spawn retries if re-queued
+          while let Some(job) = orchestrator.next_job() {
+            info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry after timeout)");
+            orchestrator.mark_running(&job.job_id);
+            spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
           }
         }
 
@@ -584,7 +614,10 @@ fn get_run_status_data(
     .ok_or_else(|| format!("run '{}' not found", run_id))?;
 
   let jobs = orchestrator.store.list_run_jobs(run_id);
+  let now = Instant::now();
   let job_infos: Vec<serde_json::Value> = jobs.iter().map(|j| {
+    let last_hb_secs = orchestrator.last_heartbeat.get(&j.job_id)
+      .map(|t| now.duration_since(*t).as_secs());
     serde_json::json!({
       "job_id": j.job_id,
       "role": j.role,
@@ -592,6 +625,7 @@ fn get_run_status_data(
       "instruction": j.instruction.chars().take(100).collect::<String>(),
       "attempt": j.attempt,
       "error": j.error,
+      "last_heartbeat_secs_ago": last_hb_secs,
     })
   }).collect();
 

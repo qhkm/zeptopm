@@ -77,7 +77,6 @@ pub fn resolve_workspace(run_id: &str, job_id: &str) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use crate::orchestrator::store::RunStore;
-    use crate::orchestrator::types::*;
 
     #[test]
     fn test_materialize_plan_creates_jobs() {

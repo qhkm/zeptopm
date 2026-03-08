@@ -149,6 +149,7 @@ pub async fn run(agent_name: String, config_path: String) {
 
         send_status("running", None);
         send_log("info", &format!("executing job {}", job_id));
+        send_progress(&job_id, "preparing", "Building context from input artifacts", None);
 
         // Build context from input artifacts
         let mut context = instruction.clone();
@@ -161,8 +162,24 @@ pub async fn run(agent_name: String, config_path: String) {
         // Create workspace directory
         std::fs::create_dir_all(&workspace).ok();
 
+        // Start heartbeat task — emits every 10s until cancelled
+        let hb_job_id = job_id.clone();
+        let heartbeat_handle = tokio::spawn(async move {
+          let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+          interval.tick().await; // skip first immediate tick
+          loop {
+            interval.tick().await;
+            send_heartbeat(&hb_job_id, "running");
+          }
+        });
+
+        send_progress(&job_id, "llm_call", "Sending request to LLM", None);
+
         match agent.chat(&context).await {
           Ok(response) => {
+            heartbeat_handle.abort();
+            send_progress(&job_id, "writing_artifact", "Writing output artifact", Some(90));
+
             // Write output artifact
             let artifact_path = format!("{}/output.md", workspace);
             std::fs::write(&artifact_path, &response).ok();
@@ -184,6 +201,7 @@ pub async fn run(agent_name: String, config_path: String) {
             send_log("info", &format!("job {} completed", job_id));
           }
           Err(e) => {
+            heartbeat_handle.abort();
             send(&serde_json::json!({
               "type": "job_failed",
               "job_id": job_id,
@@ -267,4 +285,16 @@ fn send_status(status: &str, error: Option<&str>) {
 
 fn send_log(level: &str, message: &str) {
   send(&serde_json::json!({"type":"log","level":level,"message":message}));
+}
+
+fn send_heartbeat(job_id: &str, phase: &str) {
+  send(&serde_json::json!({"type":"heartbeat","job_id":job_id,"phase":phase}));
+}
+
+fn send_progress(job_id: &str, phase: &str, message: &str, percent: Option<u8>) {
+  let mut msg = serde_json::json!({"type":"progress","job_id":job_id,"phase":phase,"message":message});
+  if let Some(p) = percent {
+    msg["percent"] = serde_json::json!(p);
+  }
+  send(&msg);
 }

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::orchestrator::scheduler::{gen_id, promote_unblocked_jobs, check_run_completion};
 use crate::orchestrator::store::RunStore;
@@ -10,6 +10,7 @@ pub struct OrchestratorEngine {
     pub ready_queue: VecDeque<JobId>,
     pub max_concurrency: usize,
     pub active_jobs: HashMap<JobId, RunId>,
+    pub last_heartbeat: HashMap<JobId, Instant>,
 }
 
 impl OrchestratorEngine {
@@ -19,6 +20,7 @@ impl OrchestratorEngine {
             ready_queue: VecDeque::new(),
             max_concurrency,
             active_jobs: HashMap::new(),
+            last_heartbeat: HashMap::new(),
         }
     }
 
@@ -89,6 +91,7 @@ impl OrchestratorEngine {
             job.started_at = Some(SystemTime::now());
             job.attempt += 1;
         }
+        self.last_heartbeat.insert(job_id.to_string(), Instant::now());
         // Transition run from Pending to Running on first job start
         if let Some(run_id) = run_id {
             if let Some(run) = self.store.get_run(&run_id) {
@@ -102,8 +105,29 @@ impl OrchestratorEngine {
         }
     }
 
+    /// Record a heartbeat for an active job.
+    pub fn record_heartbeat(&mut self, job_id: &str) {
+        if self.active_jobs.contains_key(job_id) {
+            self.last_heartbeat.insert(job_id.to_string(), Instant::now());
+        }
+    }
+
+    /// Return job IDs that haven't sent a heartbeat within the given timeout.
+    pub fn stale_jobs(&self, timeout: Duration) -> Vec<JobId> {
+        let now = Instant::now();
+        self.active_jobs.keys()
+            .filter(|job_id| {
+                self.last_heartbeat.get(*job_id)
+                    .map(|t| now.duration_since(*t) > timeout)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Mark a job as completed. Promotes unblocked dependents. Checks run completion.
     pub fn mark_completed(&mut self, job_id: &str, output_artifact_ids: Vec<ArtifactId>) {
+        self.last_heartbeat.remove(job_id);
         let run_id = self.active_jobs.remove(job_id);
         if let Some(job) = self.store.get_job_mut(job_id) {
             job.status = JobStatus::Completed;
@@ -121,6 +145,7 @@ impl OrchestratorEngine {
 
     /// Mark a job as failed. Retries if attempts remain.
     pub fn mark_failed(&mut self, job_id: &str, error: String) {
+        self.last_heartbeat.remove(job_id);
         let run_id = self.active_jobs.remove(job_id);
         if let Some(job) = self.store.get_job_mut(job_id) {
             job.error = Some(error);
@@ -182,7 +207,7 @@ mod tests {
     fn test_mark_completed_promotes_dependents() {
         let mut engine = OrchestratorEngine::new(4);
         let run_id = engine.submit_run("test".into());
-        let run = engine.store.get_run(&run_id).unwrap().clone();
+        let _run = engine.store.get_run(&run_id).unwrap().clone();
 
         // Get the planner job and mark it running then completed
         let planner_job = engine.next_job().unwrap();
@@ -255,6 +280,67 @@ mod tests {
         let j = engine.store.get_job(&job_id).unwrap();
         assert_eq!(j.status, JobStatus::Failed);
         assert!(j.finished_at.is_some());
+    }
+
+    #[test]
+    fn test_record_heartbeat_updates_timestamp() {
+        let mut engine = OrchestratorEngine::new(4);
+        engine.submit_run("test".into());
+        let job = engine.next_job().unwrap();
+        engine.mark_running(&job.job_id);
+
+        // Should have no stale jobs right after mark_running
+        let stale = engine.stale_jobs(Duration::from_secs(60));
+        assert!(stale.is_empty());
+
+        // Record heartbeat again
+        engine.record_heartbeat(&job.job_id);
+        let stale = engine.stale_jobs(Duration::from_secs(60));
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn test_stale_jobs_detects_timeout() {
+        let mut engine = OrchestratorEngine::new(4);
+        engine.submit_run("test".into());
+        let job = engine.next_job().unwrap();
+        engine.mark_running(&job.job_id);
+
+        // Fake an old heartbeat by inserting a past timestamp
+        engine.last_heartbeat.insert(
+            job.job_id.clone(),
+            Instant::now() - Duration::from_secs(120),
+        );
+
+        let stale = engine.stale_jobs(Duration::from_secs(60));
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0], job.job_id);
+    }
+
+    #[test]
+    fn test_heartbeat_cleared_on_complete() {
+        let mut engine = OrchestratorEngine::new(4);
+        engine.submit_run("test".into());
+        let job = engine.next_job().unwrap();
+        engine.mark_running(&job.job_id);
+        assert!(engine.last_heartbeat.contains_key(&job.job_id));
+
+        engine.mark_completed(&job.job_id, vec![]);
+        assert!(!engine.last_heartbeat.contains_key(&job.job_id));
+    }
+
+    #[test]
+    fn test_heartbeat_cleared_on_fail() {
+        let mut engine = OrchestratorEngine::new(4);
+        engine.submit_run("test".into());
+        let job = engine.next_job().unwrap();
+        engine.mark_running(&job.job_id);
+        assert!(engine.last_heartbeat.contains_key(&job.job_id));
+
+        engine.mark_failed(&job.job_id, "error".into());
+        // On retry, heartbeat is cleared from last_heartbeat (removed from active)
+        // but job is re-queued as Ready
+        assert!(!engine.last_heartbeat.contains_key(&job.job_id));
     }
 
     #[test]

@@ -88,7 +88,6 @@ pub fn gen_id(prefix: &str) -> String {
 mod tests {
     use super::*;
     use crate::orchestrator::store::RunStore;
-    use crate::orchestrator::types::*;
     use std::time::SystemTime;
     use std::collections::HashMap;
 
