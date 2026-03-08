@@ -1,7 +1,8 @@
 //! ZeptoKernel capsule integration — runs orchestration jobs inside isolated capsules.
 //!
-//! When `isolation = "capsule"` in config, jobs are executed via ZeptoKernel's
-//! ProcessBackend + Supervisor instead of bare child processes.
+//! When `isolation` is `"capsule"`, `"process"`, or `"namespace"` in config,
+//! jobs are executed via `CapsuleBackend` (selected by `make_backend`) instead
+//! of bare child processes.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -145,15 +146,18 @@ pub fn job_to_spec(job: &Job, input_artifact_paths: Vec<String>, config: &crate:
 
 /// Spawn an orchestration job inside a ZeptoKernel capsule.
 ///
-/// Runs `Supervisor::run_job()` in a background tokio task.
+/// Runs `CapsuleBackend::run_job()` in a background tokio task.
 /// Translates `JobOutcome` into events on the orchestrator event channel.
 /// Sends periodic heartbeats so ZeptoPM's stale-job detection doesn't trigger.
+///
+/// The backend is selected via `make_backend(config)`, which routes
+/// `"process"`, `"capsule"`, and `"namespace"` isolation modes through the
+/// appropriate `CapsuleBackend` variant.
 pub async fn spawn_capsule_job(
   job: &Job,
-  guest_binary: &str,
+  config: &crate::config::Config,
   orch_event_tx: mpsc::Sender<serde_json::Value>,
   orchestrator_store: &RunStore,
-  config: &crate::config::Config,
 ) {
   let input_artifacts: Vec<String> = job
     .input_artifact_ids
@@ -163,15 +167,18 @@ pub async fn spawn_capsule_job(
     .collect();
 
   let spec = job_to_spec(job, input_artifacts, config);
-  let guest_binary = guest_binary.to_string();
+  let guest_binary = config
+    .daemon
+    .worker_binary
+    .as_deref()
+    .unwrap_or("zk-guest")
+    .to_string();
+  let backend = make_backend(config);
   let job_id = job.job_id.clone();
 
   info!(job_id = %job_id, "spawning capsule job via ZeptoKernel");
 
   tokio::spawn(async move {
-    let backend = ProcessBackend::new(&guest_binary);
-    let mut supervisor = Supervisor::new();
-
     // Send periodic heartbeats to ZeptoPM while the capsule runs
     let hb_tx = orch_event_tx.clone();
     let hb_job_id = job_id.clone();
@@ -188,7 +195,7 @@ pub async fn spawn_capsule_job(
       }
     });
 
-    let result = supervisor.run_job(&backend, &spec, &guest_binary).await;
+    let result = backend.run_job(&spec, &guest_binary).await;
     hb_handle.abort(); // stop heartbeat timer
 
     match result {
