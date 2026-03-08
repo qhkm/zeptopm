@@ -217,352 +217,403 @@ async fn main() {
       zeptopm::daemon::run(cli.config, bind).await;
     }
     Some(Commands::Status) => {
-      match http_get(&cli.addr, "/status").await {
+      let result: CliResult = match http_get(&cli.addr, "/status").await {
         Ok(body) => {
-          let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-          if let Some(agents) = resp.get("agents").and_then(|a| a.as_array()) {
-            if agents.is_empty() {
-              println!("No agents running.");
-              return;
-            }
+          serde_json::from_str::<serde_json::Value>(&body)
+            .map_err(|e| CliError::parse_error(&e.to_string()))
+        }
+        Err(_) => Err(CliError::daemon_unreachable(&cli.addr)),
+      };
+      output_result(result, cli.json, |data| {
+        if let Some(agents) = data.get("agents").and_then(|a| a.as_array()) {
+          if agents.is_empty() {
+            println!("No agents running.");
+            return;
+          }
+          println!(
+            "{:<20} {:<15} {:<8} {:<12} {}",
+            "NAME", "STATUS", "RESTARTS", "TOKENS", "UPTIME"
+          );
+          println!("{}", "-".repeat(70));
+          for agent in agents {
+            let name = agent.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let status = agent.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+            let restarts = agent.get("restart_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let tokens = agent.get("tokens_used").and_then(|v| v.as_u64()).unwrap_or(0);
+            let uptime = agent
+              .get("uptime_secs")
+              .and_then(|v| v.as_u64())
+              .map(format_uptime)
+              .unwrap_or_else(|| "-".into());
             println!(
               "{:<20} {:<15} {:<8} {:<12} {}",
-              "NAME", "STATUS", "RESTARTS", "TOKENS", "UPTIME"
+              name, status, restarts, tokens, uptime
             );
-            println!("{}", "-".repeat(70));
-            for agent in agents {
-              let name = agent.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-              let status = agent.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-              let restarts = agent.get("restart_count").and_then(|v| v.as_u64()).unwrap_or(0);
-              let tokens = agent.get("tokens_used").and_then(|v| v.as_u64()).unwrap_or(0);
-              let uptime = agent
-                .get("uptime_secs")
-                .and_then(|v| v.as_u64())
-                .map(format_uptime)
-                .unwrap_or_else(|| "-".into());
-              println!(
-                "{:<20} {:<15} {:<8} {:<12} {}",
-                name, status, restarts, tokens, uptime
-              );
-            }
           }
         }
-        Err(e) => {
-          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-          eprintln!("Is the daemon running? Start with: zeptopm daemon");
-          std::process::exit(1);
-        }
-      }
+      });
     }
     Some(Commands::List) => {
-      let config = match zeptopm::config::load_config(&cli.config) {
-        Ok(c) => c,
-        Err(e) => {
-          eprintln!("Failed to load config: {}", e);
-          std::process::exit(1);
+      let result: CliResult = match zeptopm::config::load_config(&cli.config) {
+        Ok(config) => {
+          let agents: Vec<serde_json::Value> = config.agents.iter().map(|a| {
+            serde_json::json!({
+              "name": a.name,
+              "auto_start": a.auto_start,
+              "provider": a.provider,
+              "model": a.model.as_deref().unwrap_or("default"),
+            })
+          }).collect();
+          Ok(serde_json::json!({ "agents": agents }))
         }
+        Err(e) => Err(CliError::invalid_config(&e.to_string())),
       };
-      for agent in &config.agents {
-        let auto = if agent.auto_start { "auto" } else { "manual" };
-        let model = agent.model.as_deref().unwrap_or("default");
-        println!(
-          "{:<20} {:<10} provider={:<15} model={}",
-          agent.name, auto, agent.provider, model
-        );
-      }
+      output_result(result, cli.json, |data| {
+        if let Some(agents) = data.get("agents").and_then(|v| v.as_array()) {
+          for agent in agents {
+            let name = agent.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let auto = if agent.get("auto_start").and_then(|v| v.as_bool()).unwrap_or(false) { "auto" } else { "manual" };
+            let provider = agent.get("provider").and_then(|v| v.as_str()).unwrap_or("?");
+            let model = agent.get("model").and_then(|v| v.as_str()).unwrap_or("default");
+            println!("{:<20} {:<10} provider={:<15} model={}", name, auto, provider, model);
+          }
+        }
+      });
     }
     Some(Commands::Chat { name, message }) => {
       let body = serde_json::json!({ "message": message });
-      match http_post(&cli.addr, &format!("/agents/{}/chat", name), &body).await {
+      let result: CliResult = match http_post(&cli.addr, &format!("/agents/{}/chat", name), &body).await {
         Ok(resp_body) => {
-          let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
-          if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
-            eprintln!("Error: {}", error);
-            std::process::exit(1);
-          }
-          if let Some(content) = resp.get("response").and_then(|v| v.as_str()) {
-            println!("{}", content);
+          match serde_json::from_str::<serde_json::Value>(&resp_body) {
+            Ok(resp) => {
+              if resp.get("error").and_then(|v| v.as_str()).is_some() {
+                Err(CliError::not_found("agent", &name))
+              } else {
+                Ok(resp)
+              }
+            }
+            Err(e) => Err(CliError::parse_error(&e.to_string())),
           }
         }
-        Err(e) => {
-          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-          eprintln!("Is the daemon running? Start with: zeptopm daemon");
-          std::process::exit(1);
+        Err(_) => Err(CliError::daemon_unreachable(&cli.addr)),
+      };
+      output_result(result, cli.json, |data| {
+        if let Some(content) = data.get("response").and_then(|v| v.as_str()) {
+          println!("{}", content);
         }
-      }
+      });
     }
     Some(Commands::Stop { name }) => {
-      match http_post(
-        &cli.addr,
-        &format!("/agents/{}/stop", name),
-        &serde_json::json!({}),
-      )
-      .await
-      {
+      let result: CliResult = match http_post(&cli.addr, &format!("/agents/{}/stop", name), &serde_json::json!({})).await {
         Ok(resp_body) => {
-          let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
-          if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
-            eprintln!("Error: {}", error);
-            std::process::exit(1);
-          }
-          if let Some(status) = resp.get("status").and_then(|v| v.as_str()) {
-            println!("{}", status);
+          match serde_json::from_str::<serde_json::Value>(&resp_body) {
+            Ok(resp) => {
+              if resp.get("error").and_then(|v| v.as_str()).is_some() {
+                Err(CliError::not_found("agent", &name))
+              } else {
+                Ok(resp)
+              }
+            }
+            Err(e) => Err(CliError::parse_error(&e.to_string())),
           }
         }
-        Err(e) => {
-          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-          std::process::exit(1);
+        Err(_) => Err(CliError::daemon_unreachable(&cli.addr)),
+      };
+      output_result(result, cli.json, |data| {
+        if let Some(status) = data.get("status").and_then(|v| v.as_str()) {
+          println!("{}", status);
         }
-      }
+      });
     }
     Some(Commands::Start { name }) => {
-      match http_post(
-        &cli.addr,
-        &format!("/agents/{}/start", name),
-        &serde_json::json!({}),
-      )
-      .await
-      {
+      let result: CliResult = match http_post(&cli.addr, &format!("/agents/{}/start", name), &serde_json::json!({})).await {
         Ok(resp_body) => {
-          let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
-          if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
-            eprintln!("Error: {}", error);
-            std::process::exit(1);
-          }
-          if let Some(status) = resp.get("status").and_then(|v| v.as_str()) {
-            println!("{}", status);
+          match serde_json::from_str::<serde_json::Value>(&resp_body) {
+            Ok(resp) => {
+              if resp.get("error").and_then(|v| v.as_str()).is_some() {
+                Err(CliError::not_found("agent", &name))
+              } else {
+                Ok(resp)
+              }
+            }
+            Err(e) => Err(CliError::parse_error(&e.to_string())),
           }
         }
-        Err(e) => {
-          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-          std::process::exit(1);
+        Err(_) => Err(CliError::daemon_unreachable(&cli.addr)),
+      };
+      output_result(result, cli.json, |data| {
+        if let Some(status) = data.get("status").and_then(|v| v.as_str()) {
+          println!("{}", status);
         }
-      }
+      });
     }
     Some(Commands::Restart { name }) => {
-      match http_post(
-        &cli.addr,
-        &format!("/agents/{}/restart", name),
-        &serde_json::json!({}),
-      )
-      .await
-      {
+      let result: CliResult = match http_post(&cli.addr, &format!("/agents/{}/restart", name), &serde_json::json!({})).await {
         Ok(resp_body) => {
-          let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
-          if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
-            eprintln!("Error: {}", error);
-            std::process::exit(1);
-          }
-          if let Some(status) = resp.get("status").and_then(|v| v.as_str()) {
-            println!("{}", status);
+          match serde_json::from_str::<serde_json::Value>(&resp_body) {
+            Ok(resp) => {
+              if resp.get("error").and_then(|v| v.as_str()).is_some() {
+                Err(CliError::not_found("agent", &name))
+              } else {
+                Ok(resp)
+              }
+            }
+            Err(e) => Err(CliError::parse_error(&e.to_string())),
           }
         }
-        Err(e) => {
-          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-          std::process::exit(1);
+        Err(_) => Err(CliError::daemon_unreachable(&cli.addr)),
+      };
+      output_result(result, cli.json, |data| {
+        if let Some(status) = data.get("status").and_then(|v| v.as_str()) {
+          println!("{}", status);
         }
-      }
+      });
     }
     Some(Commands::Pipeline { agents, message }) => {
       let agent_names: Vec<&str> = agents.split(',').map(|s| s.trim()).collect();
       if agent_names.is_empty() {
-        eprintln!("No agents specified");
-        std::process::exit(1);
+        let result: CliResult = Err(CliError { message: "No agents specified".into(), code: "INVALID_CONFIG".into() });
+        output_result(result, cli.json, |_| {});
+        return;
       }
 
+      let mut steps = Vec::new();
       let mut current_message = message.clone();
+      let mut failed = false;
+
       for (i, agent_name) in agent_names.iter().enumerate() {
-        println!("--- [{}] {} ---", i + 1, agent_name);
         let body = serde_json::json!({ "message": current_message });
         match http_post(&cli.addr, &format!("/agents/{}/chat", agent_name), &body).await {
           Ok(resp_body) => {
             let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
             if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
-              eprintln!("Error from {}: {}", agent_name, error);
-              std::process::exit(1);
+              let result: CliResult = Err(CliError::not_found("agent", agent_name));
+              output_result(result, cli.json, |_| {
+                eprintln!("Error from {}: {}", agent_name, error);
+              });
+              failed = true;
+              break;
             }
-            if let Some(content) = resp.get("response").and_then(|v| v.as_str()) {
-              println!("{}", content);
-              if i < agent_names.len() - 1 {
-                current_message = format!(
-                  "Previous step (from {}): {}\n\nContinue with the original task: {}",
-                  agent_name, content, message
-                );
-              }
+            let response = resp.get("response").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            steps.push(serde_json::json!({ "agent": agent_name, "response": response }));
+            if i < agent_names.len() - 1 {
+              current_message = format!(
+                "Previous step (from {}): {}\n\nContinue with the original task: {}",
+                agent_name, response, message
+              );
             }
           }
-          Err(e) => {
-            eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-            std::process::exit(1);
+          Err(_) => {
+            let result: CliResult = Err(CliError::daemon_unreachable(&cli.addr));
+            output_result(result, cli.json, |_| {});
+            failed = true;
+            break;
           }
         }
-        println!();
+      }
+
+      if !failed {
+        let result: CliResult = Ok(serde_json::json!({ "steps": steps }));
+        output_result(result, cli.json, |data| {
+          if let Some(steps) = data.get("steps").and_then(|v| v.as_array()) {
+            for (i, step) in steps.iter().enumerate() {
+              let agent = step.get("agent").and_then(|v| v.as_str()).unwrap_or("?");
+              let response = step.get("response").and_then(|v| v.as_str()).unwrap_or("");
+              println!("--- [{}] {} ---", i + 1, agent);
+              println!("{}\n", response);
+            }
+          }
+        });
       }
     }
     Some(Commands::Orchestrate { manager, message }) => {
       let body = serde_json::json!({ "message": message });
-      match http_post(&cli.addr, &format!("/orchestrate/{}", manager), &body).await {
+      let result: CliResult = match http_post(&cli.addr, &format!("/orchestrate/{}", manager), &body).await {
         Ok(resp_body) => {
-          let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
-          if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
-            eprintln!("Error: {}", error);
-            std::process::exit(1);
-          }
-          if let Some(delegations) = resp.get("delegations").and_then(|v| v.as_array()) {
-            if !delegations.is_empty() {
-              println!("--- delegations ---");
-              for d in delegations {
-                let to = d.get("to").and_then(|v| v.as_str()).unwrap_or("?");
-                let query = d.get("query").and_then(|v| v.as_str()).unwrap_or("?");
-                let result = d.get("result").and_then(|v| v.as_str()).unwrap_or("?");
-                println!("  -> @{}: {}", to, query);
-                println!("  <- {}", result);
-                println!();
+          match serde_json::from_str::<serde_json::Value>(&resp_body) {
+            Ok(resp) => {
+              if resp.get("error").and_then(|v| v.as_str()).is_some() {
+                Err(CliError::not_found("agent", &manager))
+              } else {
+                Ok(resp)
               }
-              println!("--- final response ---");
             }
-          }
-          if let Some(response) = resp.get("response").and_then(|v| v.as_str()) {
-            println!("{}", response);
-          }
-          if let Some(rounds) = resp.get("rounds").and_then(|v| v.as_u64()) {
-            if rounds > 1 {
-              eprintln!("\n({} rounds)", rounds);
-            }
+            Err(e) => Err(CliError::parse_error(&e.to_string())),
           }
         }
-        Err(e) => {
-          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-          eprintln!("Is the daemon running? Start with: zeptopm daemon");
-          std::process::exit(1);
+        Err(_) => Err(CliError::daemon_unreachable(&cli.addr)),
+      };
+      output_result(result, cli.json, |data| {
+        if let Some(delegations) = data.get("delegations").and_then(|v| v.as_array()) {
+          if !delegations.is_empty() {
+            println!("--- delegations ---");
+            for d in delegations {
+              let to = d.get("to").and_then(|v| v.as_str()).unwrap_or("?");
+              let query = d.get("query").and_then(|v| v.as_str()).unwrap_or("?");
+              let result = d.get("result").and_then(|v| v.as_str()).unwrap_or("?");
+              println!("  -> @{}: {}", to, query);
+              println!("  <- {}", result);
+              println!();
+            }
+            println!("--- final response ---");
+          }
         }
-      }
+        if let Some(response) = data.get("response").and_then(|v| v.as_str()) {
+          println!("{}", response);
+        }
+        if let Some(rounds) = data.get("rounds").and_then(|v| v.as_u64()) {
+          if rounds > 1 {
+            eprintln!("\n({} rounds)", rounds);
+          }
+        }
+      });
     }
     Some(Commands::Run { action }) => {
       match action {
         RunAction::Submit { task, tail } => {
           let body = serde_json::json!({ "task": task });
-          let run_id = match http_post(&cli.addr, "/runs", &body).await {
+          let result: CliResult = match http_post(&cli.addr, "/runs", &body).await {
             Ok(resp_body) => {
-              let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
-              if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
-                eprintln!("Error: {}", error);
-                std::process::exit(1);
+              match serde_json::from_str::<serde_json::Value>(&resp_body) {
+                Ok(resp) => {
+                  if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+                    Err(CliError { message: error.into(), code: "SUBMIT_FAILED".into() })
+                  } else {
+                    Ok(resp)
+                  }
+                }
+                Err(e) => Err(CliError::parse_error(&e.to_string())),
               }
-              let id = resp.get("run_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-              println!("Run submitted: {}", id);
-              id
             }
-            Err(e) => {
-              eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-              std::process::exit(1);
-            }
+            Err(_) => Err(CliError::daemon_unreachable(&cli.addr)),
           };
+
+          let run_id = result.as_ref().ok()
+            .and_then(|d| d.get("run_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+          output_result(result, cli.json, |data| {
+            if let Some(id) = data.get("run_id").and_then(|v| v.as_str()) {
+              println!("Run submitted: {}", id);
+            }
+          });
+
           if tail && !run_id.is_empty() {
             tail_run(&cli.addr, &run_id).await;
           }
         }
         RunAction::Status { run_id, tail } => {
-          match http_get(&cli.addr, &format!("/runs/{}", run_id)).await {
+          let result: CliResult = match http_get(&cli.addr, &format!("/runs/{}", run_id)).await {
             Ok(resp_body) => {
-              print_run_status(&resp_body);
+              match serde_json::from_str::<serde_json::Value>(&resp_body) {
+                Ok(resp) => {
+                  if resp.get("error").and_then(|v| v.as_str()).is_some() {
+                    Err(CliError::not_found("run", &run_id))
+                  } else {
+                    Ok(resp)
+                  }
+                }
+                Err(e) => Err(CliError::parse_error(&e.to_string())),
+              }
             }
-            Err(e) => {
-              eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-              std::process::exit(1);
-            }
-          }
+            Err(_) => Err(CliError::daemon_unreachable(&cli.addr)),
+          };
+          output_result(result, cli.json, |data| {
+            let body = serde_json::to_string(data).unwrap_or_default();
+            print_run_status(&body);
+          });
           if tail {
             tail_run(&cli.addr, &run_id).await;
           }
         }
         RunAction::List => {
-          match http_get(&cli.addr, "/runs").await {
+          let result: CliResult = match http_get(&cli.addr, "/runs").await {
             Ok(resp_body) => {
-              let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
-              if let Some(runs) = resp.get("runs").and_then(|v| v.as_array()) {
-                if runs.is_empty() {
-                  println!("No runs.");
-                  return;
-                }
-                println!("{:<24} {:<12} {}", "RUN ID", "STATUS", "TASK");
-                println!("{}", "-".repeat(70));
-                for run in runs {
-                  let id = run.get("run_id").and_then(|v| v.as_str()).unwrap_or("?");
-                  let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                  let task = run.get("task").and_then(|v| v.as_str()).unwrap_or("");
-                  let short_task: String = task.chars().take(40).collect();
-                  println!("{:<24} {:<12} {}", id, status, short_task);
-                }
+              serde_json::from_str::<serde_json::Value>(&resp_body)
+                .map_err(|e| CliError::parse_error(&e.to_string()))
+            }
+            Err(_) => Err(CliError::daemon_unreachable(&cli.addr)),
+          };
+          output_result(result, cli.json, |data| {
+            if let Some(runs) = data.get("runs").and_then(|v| v.as_array()) {
+              if runs.is_empty() {
+                println!("No runs.");
+                return;
+              }
+              println!("{:<24} {:<12} {}", "RUN ID", "STATUS", "TASK");
+              println!("{}", "-".repeat(70));
+              for run in runs {
+                let id = run.get("run_id").and_then(|v| v.as_str()).unwrap_or("?");
+                let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                let task = run.get("task").and_then(|v| v.as_str()).unwrap_or("");
+                let short_task: String = task.chars().take(40).collect();
+                println!("{:<24} {:<12} {}", id, status, short_task);
               }
             }
-            Err(e) => {
-              eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-              eprintln!("Is the daemon running? Start with: zeptopm daemon");
-              std::process::exit(1);
-            }
-          }
+          });
         }
         RunAction::Result { run_id } => {
-          match http_get(&cli.addr, &format!("/runs/{}/result", run_id)).await {
+          let result: CliResult = match http_get(&cli.addr, &format!("/runs/{}/result", run_id)).await {
             Ok(resp_body) => {
-              let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
-              if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
-                eprintln!("Error: {}", error);
-                std::process::exit(1);
-              }
-              let status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-              println!("Run: {}  Status: {}", run_id, status);
-              if let Some(artifacts) = resp.get("artifacts").and_then(|v| v.as_array()) {
-                for artifact in artifacts {
-                  let kind = artifact.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-                  let summary = artifact.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-                  let path = artifact.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                  println!("\n--- artifact ({}) ---", kind);
-                  if !summary.is_empty() {
-                    println!("Summary: {}", summary);
+              match serde_json::from_str::<serde_json::Value>(&resp_body) {
+                Ok(resp) => {
+                  if resp.get("error").and_then(|v| v.as_str()).is_some() {
+                    Err(CliError::not_found("run", &run_id))
+                  } else {
+                    Ok(resp)
                   }
-                  if !path.is_empty() {
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                      println!("{}", content);
-                    } else {
-                      println!("(file: {})", path);
-                    }
+                }
+                Err(e) => Err(CliError::parse_error(&e.to_string())),
+              }
+            }
+            Err(_) => Err(CliError::daemon_unreachable(&cli.addr)),
+          };
+          output_result(result, cli.json, |data| {
+            let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+            println!("Run: {}  Status: {}", run_id, status);
+            if let Some(artifacts) = data.get("artifacts").and_then(|v| v.as_array()) {
+              for artifact in artifacts {
+                let kind = artifact.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                let summary = artifact.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                let path = artifact.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                println!("\n--- artifact ({}) ---", kind);
+                if !summary.is_empty() {
+                  println!("Summary: {}", summary);
+                }
+                if !path.is_empty() {
+                  if let Ok(content) = std::fs::read_to_string(path) {
+                    println!("{}", content);
+                  } else {
+                    println!("(file: {})", path);
                   }
                 }
               }
             }
-            Err(e) => {
-              eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-              eprintln!("Is the daemon running? Start with: zeptopm daemon");
-              std::process::exit(1);
-            }
-          }
+          });
         }
         RunAction::Cancel { run_id } => {
-          match http_post(
-            &cli.addr,
-            &format!("/runs/{}/cancel", run_id),
-            &serde_json::json!({}),
-          )
-          .await
-          {
+          let result: CliResult = match http_post(&cli.addr, &format!("/runs/{}/cancel", run_id), &serde_json::json!({})).await {
             Ok(resp_body) => {
-              let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
-              if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
-                eprintln!("Error: {}", error);
-                std::process::exit(1);
-              }
-              if let Some(status) = resp.get("status").and_then(|v| v.as_str()) {
-                println!("{}", status);
+              match serde_json::from_str::<serde_json::Value>(&resp_body) {
+                Ok(resp) => {
+                  if resp.get("error").and_then(|v| v.as_str()).is_some() {
+                    Err(CliError::not_found("run", &run_id))
+                  } else {
+                    Ok(resp)
+                  }
+                }
+                Err(e) => Err(CliError::parse_error(&e.to_string())),
               }
             }
-            Err(e) => {
-              eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-              eprintln!("Is the daemon running? Start with: zeptopm daemon");
-              std::process::exit(1);
+            Err(_) => Err(CliError::daemon_unreachable(&cli.addr)),
+          };
+          output_result(result, cli.json, |data| {
+            if let Some(status) = data.get("status").and_then(|v| v.as_str()) {
+              println!("{}", status);
             }
-          }
+          });
         }
       }
     }
@@ -574,32 +625,35 @@ async fn main() {
       zeptopm::worker::run(agent, config).await;
     }
     Some(Commands::Logs { name }) => {
-      match http_get(&cli.addr, &format!("/agents/{}/logs", name)).await {
+      let result: CliResult = match http_get(&cli.addr, &format!("/agents/{}/logs", name)).await {
         Ok(body) => {
-          let resp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-          if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
-            eprintln!("Error: {}", error);
-            std::process::exit(1);
-          }
-          if let Some(logs) = resp.get("logs").and_then(|v| v.as_array()) {
-            if logs.is_empty() {
-              println!("No logs for agent '{}'.", name);
-              return;
+          match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(resp) => {
+              if resp.get("error").and_then(|v| v.as_str()).is_some() {
+                Err(CliError::not_found("agent", &name))
+              } else {
+                Ok(resp)
+              }
             }
-            for entry in logs {
-              let ts = entry.get("timestamp").and_then(|v| v.as_str()).unwrap_or("?");
-              let level = entry.get("level").and_then(|v| v.as_str()).unwrap_or("?");
-              let msg = entry.get("message").and_then(|v| v.as_str()).unwrap_or("?");
-              println!("{} [{}] {}", ts, level, msg);
-            }
+            Err(e) => Err(CliError::parse_error(&e.to_string())),
           }
         }
-        Err(e) => {
-          eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-          eprintln!("Is the daemon running? Start with: zeptopm daemon");
-          std::process::exit(1);
+        Err(_) => Err(CliError::daemon_unreachable(&cli.addr)),
+      };
+      output_result(result, cli.json, |data| {
+        if let Some(logs) = data.get("logs").and_then(|v| v.as_array()) {
+          if logs.is_empty() {
+            println!("No logs for agent '{}'.", name);
+            return;
+          }
+          for entry in logs {
+            let ts = entry.get("timestamp").and_then(|v| v.as_str()).unwrap_or("?");
+            let level = entry.get("level").and_then(|v| v.as_str()).unwrap_or("?");
+            let msg = entry.get("message").and_then(|v| v.as_str()).unwrap_or("?");
+            println!("{} [{}] {}", ts, level, msg);
+          }
         }
-      }
+      });
     }
     None => {
       // Default: run daemon
