@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::orchestrator::scheduler::{gen_id, promote_unblocked_jobs, check_run_completion};
+use crate::orchestrator::scheduler::{check_run_completion, gen_id, promote_unblocked_jobs};
 use crate::orchestrator::store::RunStore;
 use crate::orchestrator::types::*;
 
@@ -92,7 +92,8 @@ impl OrchestratorEngine {
             job.started_at = Some(SystemTime::now());
             job.attempt += 1;
         }
-        self.last_heartbeat.insert(job_id.to_string(), Instant::now());
+        self.last_heartbeat
+            .insert(job_id.to_string(), Instant::now());
         // Transition run from Pending to Running on first job start
         if let Some(run_id) = run_id {
             if let Some(run) = self.store.get_run(&run_id) {
@@ -109,16 +110,19 @@ impl OrchestratorEngine {
     /// Record a heartbeat for an active job.
     pub fn record_heartbeat(&mut self, job_id: &str) {
         if self.active_jobs.contains_key(job_id) {
-            self.last_heartbeat.insert(job_id.to_string(), Instant::now());
+            self.last_heartbeat
+                .insert(job_id.to_string(), Instant::now());
         }
     }
 
     /// Return job IDs that haven't sent a heartbeat within the given timeout.
     pub fn stale_jobs(&self, timeout: Duration) -> Vec<JobId> {
         let now = Instant::now();
-        self.active_jobs.keys()
+        self.active_jobs
+            .keys()
             .filter(|job_id| {
-                self.last_heartbeat.get(*job_id)
+                self.last_heartbeat
+                    .get(*job_id)
                     .map(|t| now.duration_since(*t) > timeout)
                     .unwrap_or(true)
             })
@@ -214,7 +218,10 @@ impl OrchestratorEngine {
             depends_on: vec![new_coder_id.clone()],
             children: vec![],
             profile_id: reviewer.profile_id.clone(),
-            workspace_dir: crate::orchestrator::planner::resolve_workspace(&run_id, &new_reviewer_id),
+            workspace_dir: crate::orchestrator::planner::resolve_workspace(
+                &run_id,
+                &new_reviewer_id,
+            ),
             attempt: 0,
             max_attempts: 3,
             created_at: now,
@@ -433,7 +440,11 @@ mod tests {
         assert!(!engine.last_heartbeat.contains_key(&job.job_id));
     }
 
-    fn make_coder_reviewer_pair(engine: &mut OrchestratorEngine, run_id: &str, parent_job_id: &str) -> (JobId, JobId) {
+    fn make_coder_reviewer_pair(
+        engine: &mut OrchestratorEngine,
+        run_id: &str,
+        parent_job_id: &str,
+    ) -> (JobId, JobId) {
         let coder_id = gen_id("job");
         let reviewer_id = gen_id("job");
         let now = SystemTime::now();
@@ -496,14 +507,17 @@ mod tests {
         let run_id = engine.submit_run("test".into());
         let planner = engine.next_job().unwrap();
 
-        let (coder_id, reviewer_id) = make_coder_reviewer_pair(&mut engine, &run_id, &planner.job_id);
+        let (coder_id, reviewer_id) =
+            make_coder_reviewer_pair(&mut engine, &run_id, &planner.job_id);
 
         // Simulate: coder completes, reviewer completes with "revise"
         engine.active_jobs.insert(coder_id.clone(), run_id.clone());
         engine.mark_running(&coder_id);
         engine.mark_completed(&coder_id, vec!["art_1".into()]);
 
-        engine.active_jobs.insert(reviewer_id.clone(), run_id.clone());
+        engine
+            .active_jobs
+            .insert(reviewer_id.clone(), run_id.clone());
         engine.mark_running(&reviewer_id);
         engine.mark_completed(&reviewer_id, vec![]);
 
@@ -536,7 +550,8 @@ mod tests {
         let run_id = engine.submit_run("test".into());
         let planner = engine.next_job().unwrap();
 
-        let (_coder_id, reviewer_id) = make_coder_reviewer_pair(&mut engine, &run_id, &planner.job_id);
+        let (_coder_id, reviewer_id) =
+            make_coder_reviewer_pair(&mut engine, &run_id, &planner.job_id);
 
         let result = engine.handle_review_completion(&reviewer_id, ReviewDecision::Approved, 3);
         assert!(result.is_none());
@@ -550,7 +565,8 @@ mod tests {
         let run_id = engine.submit_run("test".into());
         let planner = engine.next_job().unwrap();
 
-        let (_coder_id, reviewer_id) = make_coder_reviewer_pair(&mut engine, &run_id, &planner.job_id);
+        let (_coder_id, reviewer_id) =
+            make_coder_reviewer_pair(&mut engine, &run_id, &planner.job_id);
 
         // Set reviewer's revision_round to max
         if let Some(j) = engine.store.get_job_mut(&reviewer_id) {
@@ -568,10 +584,16 @@ mod tests {
     fn test_mark_running_transitions_run_to_running() {
         let mut engine = OrchestratorEngine::new(4);
         let run_id = engine.submit_run("test".into());
-        assert_eq!(engine.store.get_run(&run_id).unwrap().status, RunStatus::Pending);
+        assert_eq!(
+            engine.store.get_run(&run_id).unwrap().status,
+            RunStatus::Pending
+        );
 
         let job = engine.next_job().unwrap();
         engine.mark_running(&job.job_id);
-        assert_eq!(engine.store.get_run(&run_id).unwrap().status, RunStatus::Running);
+        assert_eq!(
+            engine.store.get_run(&run_id).unwrap().status,
+            RunStatus::Running
+        );
     }
 }

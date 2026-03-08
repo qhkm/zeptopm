@@ -14,7 +14,8 @@ pub fn promote_unblocked_jobs(store: &mut RunStore, run_id: &str) -> Vec<JobId> 
     let mut promoted = Vec::new();
     for (job_id, deps) in pending {
         let all_complete = deps.iter().all(|dep_id| {
-            store.get_job(dep_id)
+            store
+                .get_job(dep_id)
                 .map(|j| j.status == JobStatus::Completed)
                 .unwrap_or(false)
         });
@@ -36,10 +37,12 @@ pub fn check_run_completion(store: &mut RunStore, run_id: &str) -> bool {
         return false;
     }
 
-    let any_active = jobs.iter().any(|j| matches!(
-        j.status,
-        JobStatus::Pending | JobStatus::Ready | JobStatus::Running
-    ));
+    let any_active = jobs.iter().any(|j| {
+        matches!(
+            j.status,
+            JobStatus::Pending | JobStatus::Ready | JobStatus::Running
+        )
+    });
     if any_active {
         return false;
     }
@@ -88,8 +91,8 @@ pub fn gen_id(prefix: &str) -> String {
 mod tests {
     use super::*;
     use crate::orchestrator::store::RunStore;
-    use std::time::SystemTime;
     use std::collections::HashMap;
+    use std::time::SystemTime;
 
     fn make_job(job_id: &str, run_id: &str, deps: Vec<&str>, status: JobStatus) -> Job {
         Job {
@@ -148,7 +151,12 @@ mod tests {
         let mut store = RunStore::new();
         store.create_job(make_job("j1", "run_1", vec![], JobStatus::Completed));
         store.create_job(make_job("j2", "run_1", vec![], JobStatus::Completed));
-        store.create_job(make_job("j3", "run_1", vec!["j1", "j2"], JobStatus::Pending));
+        store.create_job(make_job(
+            "j3",
+            "run_1",
+            vec!["j1", "j2"],
+            JobStatus::Pending,
+        ));
         let promoted = promote_unblocked_jobs(&mut store, "run_1");
         assert_eq!(promoted, vec!["j3"]);
     }
@@ -158,7 +166,12 @@ mod tests {
         let mut store = RunStore::new();
         store.create_job(make_job("j1", "run_1", vec![], JobStatus::Completed));
         store.create_job(make_job("j2", "run_1", vec![], JobStatus::Running));
-        store.create_job(make_job("j3", "run_1", vec!["j1", "j2"], JobStatus::Pending));
+        store.create_job(make_job(
+            "j3",
+            "run_1",
+            vec!["j1", "j2"],
+            JobStatus::Pending,
+        ));
         let promoted = promote_unblocked_jobs(&mut store, "run_1");
         assert!(promoted.is_empty());
     }

@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use tokio::sync::mpsc;
 
-use zeptopm::capsule::{capsule_spec_from_config, build_worker_env, spawn_capsule_job};
+use zeptopm::capsule::{build_worker_env, capsule_spec_from_config, spawn_capsule_job};
 use zeptopm::config::{AgentConfig, Config, DaemonConfig};
 use zeptopm::orchestrator::store::RunStore;
 use zeptopm::orchestrator::types::{Job, JobStatus};
@@ -93,6 +93,7 @@ fn test_capsule_spec_from_config_integration() {
     assert_eq!(spec.isolation, zeptokernel::Isolation::Process);
     assert_eq!(spec.limits.timeout_sec, 30);
     assert!(spec.limits.memory_mib.is_none());
+    assert_eq!(spec.workspace.host_path, Some(job.workspace_dir.clone()));
     assert!(spec.init_binary.is_none());
 }
 
@@ -121,7 +122,7 @@ async fn test_capsule_spawn_missing_binary() {
     let (tx, mut rx) = mpsc::channel(32);
 
     std::fs::create_dir_all(&job.workspace_dir).unwrap();
-    spawn_capsule_job(&job, &config, tx, &store).await;
+    let (_handle, _join) = spawn_capsule_job(&job, &config, tx, &store);
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -158,7 +159,7 @@ async fn test_capsule_namespace_not_supported() {
     let (tx, mut rx) = mpsc::channel(32);
 
     std::fs::create_dir_all(&job.workspace_dir).unwrap();
-    spawn_capsule_job(&job, &config, tx, &store).await;
+    let (_handle, _join) = spawn_capsule_job(&job, &config, tx, &store);
 
     #[cfg(not(target_os = "linux"))]
     {

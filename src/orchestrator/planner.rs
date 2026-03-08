@@ -25,10 +25,16 @@ pub fn validate_plan(plan: &ExecutionPlan) -> Vec<String> {
             errors.push(format!("job[{}] '{}': role is empty", i, job.local_id));
         }
         if job.profile_id.trim().is_empty() {
-            errors.push(format!("job[{}] '{}': profile_id is empty", i, job.local_id));
+            errors.push(format!(
+                "job[{}] '{}': profile_id is empty",
+                i, job.local_id
+            ));
         }
         if job.instruction.trim().is_empty() {
-            errors.push(format!("job[{}] '{}': instruction is empty", i, job.local_id));
+            errors.push(format!(
+                "job[{}] '{}': instruction is empty",
+                i, job.local_id
+            ));
         }
         for dep in &job.depends_on {
             if !local_ids.contains(dep.as_str()) {

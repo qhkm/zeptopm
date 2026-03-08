@@ -7,1038 +7,1114 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::agent::{
-  push_log, spawn_agent, AgentHandle, AgentState, AgentStateUpdate, AgentStatus,
-};
+use crate::agent::{AgentHandle, AgentState, AgentStateUpdate, AgentStatus, push_log, spawn_agent};
 use crate::config::{self, Config};
 use crate::orchestrator::engine::OrchestratorEngine;
 use crate::server::{self, DaemonCommand, ManagedAgentRef, ResolvedGatewayConfig, SharedState};
 
 /// Run the daemon. This is the main entry point.
 pub async fn run(config_path: String, bind: Option<String>) {
-  let config = match config::load_config(&config_path) {
-    Ok(c) => c,
-    Err(e) => {
-      eprintln!("Failed to load config: {}", e);
-      std::process::exit(1);
-    }
-  };
-
-  let errors = config::validate_config(&config);
-  if !errors.is_empty() {
-    for e in &errors {
-      eprintln!("Config error: {}", e);
-    }
-    std::process::exit(1);
-  }
-
-  info!(
-    agents = config.agents.len(),
-    poll_interval_ms = config.daemon.poll_interval_ms,
-    "zeptopm daemon starting"
-  );
-
-  let daemon_start = Instant::now();
-  let (state_tx, mut state_rx) = mpsc::channel::<AgentStateUpdate>(256);
-
-  // Daemon command channel (HTTP handlers -> daemon loop)
-  let (daemon_cmd_tx, mut daemon_cmd_rx) = mpsc::channel::<DaemonCommand>(64);
-
-  // Shared state for HTTP server
-  let shared_state = server::new_shared_state(daemon_cmd_tx);
-
-  // Track internal daemon state (owns JoinHandles, restart config)
-  let mut managed: HashMap<String, InternalAgent> = HashMap::new();
-
-  // Initialize orchestrator
-  let mut orchestrator = OrchestratorEngine::new(4);
-  let (orch_event_tx, mut orch_event_rx) = mpsc::channel::<serde_json::Value>(256);
-
-  // Initialize SQLite persistence
-  let db_path = dirs::home_dir()
-    .unwrap_or_else(|| std::path::PathBuf::from("."))
-    .join(".zeptopm")
-    .join("zeptopm.db");
-  let db = match crate::orchestrator::sqlite_store::SqlitePersistence::new(
-    &db_path.to_string_lossy(),
-  ) {
-    Ok(db) => {
-      if let Err(e) = db.init_schema() {
-        warn!(error = %e, "failed to init SQLite schema — running without persistence");
-        None
-      } else {
-        info!(path = %db_path.display(), "SQLite persistence enabled");
-        Some(db)
-      }
-    }
-    Err(e) => {
-      warn!(error = %e, "failed to open SQLite — running without persistence");
-      None
-    }
-  };
-
-  // Hydrate orchestrator from SQLite (resume after restart)
-  if let Some(ref db) = db {
-    let mut hydrated_runs = 0u32;
-    let mut hydrated_jobs = 0u32;
-    let mut resumed_runs = 0u32;
-
-    if let Ok(runs) = db.load_runs() {
-      for run in runs {
-        hydrated_runs += 1;
-        orchestrator.store.create_run(run);
-      }
-    }
-    if let Ok(jobs) = db.load_jobs() {
-      for job in jobs {
-        hydrated_jobs += 1;
-        // Running jobs from a previous daemon session are dead — mark failed for retry
-        if job.status == crate::orchestrator::types::JobStatus::Running {
-          let mut failed_job = job;
-          failed_job.error = Some("daemon restarted — process lost".into());
-          if failed_job.attempt < failed_job.max_attempts {
-            failed_job.status = crate::orchestrator::types::JobStatus::Ready;
-            failed_job.finished_at = None;
-            orchestrator.ready_queue.push_back(failed_job.job_id.clone());
-          } else {
-            failed_job.status = crate::orchestrator::types::JobStatus::Failed;
-            failed_job.finished_at = Some(std::time::SystemTime::now());
-          }
-          orchestrator.store.create_job(failed_job);
-        } else if job.status == crate::orchestrator::types::JobStatus::Ready {
-          orchestrator.ready_queue.push_back(job.job_id.clone());
-          orchestrator.store.create_job(job);
-        } else {
-          orchestrator.store.create_job(job);
+    let config = match config::load_config(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to load config: {}", e);
+            std::process::exit(1);
         }
-      }
-    }
-    if let Ok(artifacts) = db.load_artifacts() {
-      for artifact in artifacts {
-        orchestrator.store.create_artifact(artifact);
-      }
-    }
+    };
 
-    // Count incomplete runs for logging
-    for run in orchestrator.store.list_runs() {
-      if run.status == crate::orchestrator::types::RunStatus::Running
-        || run.status == crate::orchestrator::types::RunStatus::Pending
-      {
-        resumed_runs += 1;
-      }
-    }
-
-    if hydrated_runs > 0 {
-      info!(
-        runs = hydrated_runs,
-        jobs = hydrated_jobs,
-        resumed = resumed_runs,
-        "hydrated orchestrator from SQLite"
-      );
-    }
-  }
-
-  // Spawn auto_start agents
-  for agent_config in &config.agents {
-    if !agent_config.auto_start {
-      continue;
-    }
-    match spawn_managed_agent(agent_config, &config_path, &config, state_tx.clone()) {
-      Ok(internal) => {
-        info!(agent = %agent_config.name, "agent spawned");
-        sync_agent_to_shared(&shared_state, &agent_config.name, &internal).await;
-        managed.insert(agent_config.name.clone(), internal);
-      }
-      Err(e) => {
-        warn!(agent = %agent_config.name, error = %e, "failed to spawn agent");
-      }
-    }
-  }
-
-  info!(running = managed.len(), "all auto_start agents spawned");
-
-  // Start HTTP server
-  let bind_addr = bind
-    .or_else(|| config.daemon.bind.clone())
-    .unwrap_or_else(|| "127.0.0.1:9876".into());
-  let server_state = shared_state.clone();
-  tokio::spawn(async move {
-    server::start_server(bind_addr, server_state).await;
-  });
-
-  // Config watcher state
-  let mut current_config = config.clone();
-  let mut last_config_hash = config::config_hash(&config);
-  let poll_interval = Duration::from_millis(config.daemon.poll_interval_ms);
-  let mut last_cleanup = Instant::now();
-
-  // Main loop
-  let mut poll_timer = tokio::time::interval(poll_interval);
-  let mut shutdown = false;
-
-  // Setup shutdown signal
-  let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-  tokio::spawn(async move {
-    let ctrl_c = tokio::signal::ctrl_c();
-    #[cfg(unix)]
-    {
-      let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-          .expect("register SIGTERM");
-      tokio::select! {
-        _ = ctrl_c => info!("received SIGINT"),
-        _ = sigterm.recv() => info!("received SIGTERM"),
-      }
-    }
-    #[cfg(not(unix))]
-    {
-      ctrl_c.await.ok();
-      info!("received SIGINT");
-    }
-    let _ = shutdown_tx.send(());
-  });
-
-  while !shutdown {
-    tokio::select! {
-      // Shutdown signal
-      _ = &mut shutdown_rx => {
-        shutdown = true;
-      }
-
-      // Agent state updates
-      Some(update) = state_rx.recv() => {
-        if let Some(internal) = managed.get_mut(&update.name) {
-          internal.state.tokens_used += update.tokens_delta;
-          internal.state.status = update.status.clone();
-          if update.error.is_some() {
-            internal.state.last_error = update.error;
-          }
-          if update.pid.is_some() {
-            internal.state.pid = update.pid;
-          }
-          if let Some(log_entry) = update.log {
-            push_log(&mut internal.state.logs, log_entry);
-          }
-
-          // Sync to shared state for HTTP handlers
-          {
-            let mut s = shared_state.write().await;
-            if let Some(m) = s.agents.get_mut(&update.name) {
-              m.state = internal.state.clone();
-            }
-          }
-
-          // Handle restart logic for errored agents
-          if update.status == AgentStatus::Stopped || update.status == AgentStatus::Error {
-            if internal.state.restart_count < internal.max_restarts {
-              let backoff = Duration::from_millis(
-                internal.restart_backoff_ms * 2u64.pow(internal.state.restart_count),
-              );
-              info!(
-                agent = %update.name,
-                restart = internal.state.restart_count + 1,
-                backoff_ms = backoff.as_millis() as u64,
-                "scheduling restart"
-              );
-              internal.state.status = AgentStatus::RestartPending;
-              internal.restart_at = Some(Instant::now() + backoff);
-            }
-          }
+    let errors = config::validate_config(&config);
+    if !errors.is_empty() {
+        for e in &errors {
+            eprintln!("Config error: {}", e);
         }
-      }
+        std::process::exit(1);
+    }
 
-      // Daemon commands from HTTP handlers (start/restart)
-      Some(cmd) = daemon_cmd_rx.recv() => {
-        match cmd {
-          DaemonCommand::Start { name, reply } => {
-            if managed.contains_key(&name) {
-              let status = &managed[&name].state.status;
-              if *status != AgentStatus::Stopped && *status != AgentStatus::Error {
-                let _ = reply.send(Err(format!("agent '{}' is already {}", name, status)));
-                continue;
+    info!(
+        agents = config.agents.len(),
+        poll_interval_ms = config.daemon.poll_interval_ms,
+        "zeptopm daemon starting"
+    );
+
+    let daemon_start = Instant::now();
+    let (state_tx, mut state_rx) = mpsc::channel::<AgentStateUpdate>(256);
+
+    // Daemon command channel (HTTP handlers -> daemon loop)
+    let (daemon_cmd_tx, mut daemon_cmd_rx) = mpsc::channel::<DaemonCommand>(64);
+
+    // Shared state for HTTP server
+    let shared_state = server::new_shared_state(daemon_cmd_tx);
+
+    // Track internal daemon state (owns JoinHandles, restart config)
+    let mut managed: HashMap<String, InternalAgent> = HashMap::new();
+
+    // Initialize orchestrator
+    let mut orchestrator = OrchestratorEngine::new(4);
+    let (orch_event_tx, mut orch_event_rx) = mpsc::channel::<serde_json::Value>(256);
+
+    // Initialize SQLite persistence
+    let db_path = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".zeptopm")
+        .join("zeptopm.db");
+    let db =
+        match crate::orchestrator::sqlite_store::SqlitePersistence::new(&db_path.to_string_lossy())
+        {
+            Ok(db) => {
+                if let Err(e) = db.init_schema() {
+                    warn!(error = %e, "failed to init SQLite schema — running without persistence");
+                    None
+                } else {
+                    info!(path = %db_path.display(), "SQLite persistence enabled");
+                    Some(db)
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to open SQLite — running without persistence");
+                None
+            }
+        };
+
+    // Hydrate orchestrator from SQLite (resume after restart)
+    if let Some(ref db) = db {
+        let mut hydrated_runs = 0u32;
+        let mut hydrated_jobs = 0u32;
+        let mut resumed_runs = 0u32;
+
+        if let Ok(runs) = db.load_runs() {
+            for run in runs {
+                hydrated_runs += 1;
+                orchestrator.store.create_run(run);
+            }
+        }
+        if let Ok(jobs) = db.load_jobs() {
+            for job in jobs {
+                hydrated_jobs += 1;
+                // Running jobs from a previous daemon session are dead — mark failed for retry
+                if job.status == crate::orchestrator::types::JobStatus::Running {
+                    let mut failed_job = job;
+                    failed_job.error = Some("daemon restarted — process lost".into());
+                    if failed_job.attempt < failed_job.max_attempts {
+                        failed_job.status = crate::orchestrator::types::JobStatus::Ready;
+                        failed_job.finished_at = None;
+                        orchestrator
+                            .ready_queue
+                            .push_back(failed_job.job_id.clone());
+                    } else {
+                        failed_job.status = crate::orchestrator::types::JobStatus::Failed;
+                        failed_job.finished_at = Some(std::time::SystemTime::now());
+                    }
+                    orchestrator.store.create_job(failed_job);
+                } else if job.status == crate::orchestrator::types::JobStatus::Ready {
+                    orchestrator.ready_queue.push_back(job.job_id.clone());
+                    orchestrator.store.create_job(job);
+                } else {
+                    orchestrator.store.create_job(job);
+                }
+            }
+        }
+        if let Ok(artifacts) = db.load_artifacts() {
+            for artifact in artifacts {
+                orchestrator.store.create_artifact(artifact);
+            }
+        }
+
+        // Count incomplete runs for logging
+        for run in orchestrator.store.list_runs() {
+            if run.status == crate::orchestrator::types::RunStatus::Running
+                || run.status == crate::orchestrator::types::RunStatus::Pending
+            {
+                resumed_runs += 1;
+            }
+        }
+
+        if hydrated_runs > 0 {
+            info!(
+                runs = hydrated_runs,
+                jobs = hydrated_jobs,
+                resumed = resumed_runs,
+                "hydrated orchestrator from SQLite"
+            );
+        }
+    }
+
+    // Spawn auto_start agents
+    for agent_config in &config.agents {
+        if !agent_config.auto_start {
+            continue;
+        }
+        match spawn_managed_agent(agent_config, &config_path, &config, state_tx.clone()) {
+            Ok(internal) => {
+                info!(agent = %agent_config.name, "agent spawned");
+                sync_agent_to_shared(&shared_state, &agent_config.name, &internal).await;
+                managed.insert(agent_config.name.clone(), internal);
+            }
+            Err(e) => {
+                warn!(agent = %agent_config.name, error = %e, "failed to spawn agent");
+            }
+        }
+    }
+
+    info!(running = managed.len(), "all auto_start agents spawned");
+
+    // Start HTTP server
+    let bind_addr = bind
+        .or_else(|| config.daemon.bind.clone())
+        .unwrap_or_else(|| "127.0.0.1:9876".into());
+    let server_state = shared_state.clone();
+    tokio::spawn(async move {
+        server::start_server(bind_addr, server_state).await;
+    });
+
+    // Config watcher state
+    let mut current_config = config.clone();
+    let mut last_config_hash = config::config_hash(&config);
+    let poll_interval = Duration::from_millis(config.daemon.poll_interval_ms);
+    let mut last_cleanup = Instant::now();
+
+    // Main loop
+    let mut poll_timer = tokio::time::interval(poll_interval);
+    let mut shutdown = false;
+
+    // Setup shutdown signal
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("register SIGTERM");
+            tokio::select! {
+              _ = ctrl_c => info!("received SIGINT"),
+              _ = sigterm.recv() => info!("received SIGTERM"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.ok();
+            info!("received SIGINT");
+        }
+        let _ = shutdown_tx.send(());
+    });
+
+    while !shutdown {
+        tokio::select! {
+          // Shutdown signal
+          _ = &mut shutdown_rx => {
+            shutdown = true;
+          }
+
+          // Agent state updates
+          Some(update) = state_rx.recv() => {
+            if let Some(internal) = managed.get_mut(&update.name) {
+              internal.state.tokens_used += update.tokens_delta;
+              internal.state.status = update.status.clone();
+              if update.error.is_some() {
+                internal.state.last_error = update.error;
               }
-              managed.remove(&name);
-              shared_state.write().await.agents.remove(&name);
-            }
+              if update.pid.is_some() {
+                internal.state.pid = update.pid;
+              }
+              if let Some(log_entry) = update.log {
+                push_log(&mut internal.state.logs, log_entry);
+              }
 
-            match current_config.agents.iter().find(|a| a.name == name) {
-              Some(agent_config) => {
-                match spawn_managed_agent(agent_config, &config_path, &current_config, state_tx.clone()) {
-                  Ok(internal) => {
-                    info!(agent = %name, "agent started via command");
-                    sync_agent_to_shared(&shared_state, &name, &internal).await;
-                    managed.insert(name.clone(), internal);
-                    let _ = reply.send(Ok(format!("agent '{}' started", name)));
+              // Sync to shared state for HTTP handlers
+              {
+                let mut s = shared_state.write().await;
+                if let Some(m) = s.agents.get_mut(&update.name) {
+                  m.state = internal.state.clone();
+                }
+              }
+
+              // Handle restart logic for errored agents
+              if update.status == AgentStatus::Stopped || update.status == AgentStatus::Error {
+                if internal.state.restart_count < internal.max_restarts {
+                  let backoff = Duration::from_millis(
+                    internal.restart_backoff_ms * 2u64.pow(internal.state.restart_count),
+                  );
+                  info!(
+                    agent = %update.name,
+                    restart = internal.state.restart_count + 1,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "scheduling restart"
+                  );
+                  internal.state.status = AgentStatus::RestartPending;
+                  internal.restart_at = Some(Instant::now() + backoff);
+                }
+              }
+            }
+          }
+
+          // Daemon commands from HTTP handlers (start/restart)
+          Some(cmd) = daemon_cmd_rx.recv() => {
+            match cmd {
+              DaemonCommand::Start { name, reply } => {
+                if managed.contains_key(&name) {
+                  let status = &managed[&name].state.status;
+                  if *status != AgentStatus::Stopped && *status != AgentStatus::Error {
+                    let _ = reply.send(Err(format!("agent '{}' is already {}", name, status)));
+                    continue;
                   }
-                  Err(e) => {
-                    let _ = reply.send(Err(format!("failed to start '{}': {}", name, e)));
+                  managed.remove(&name);
+                  shared_state.write().await.agents.remove(&name);
+                }
+
+                match current_config.agents.iter().find(|a| a.name == name) {
+                  Some(agent_config) => {
+                    match spawn_managed_agent(agent_config, &config_path, &current_config, state_tx.clone()) {
+                      Ok(internal) => {
+                        info!(agent = %name, "agent started via command");
+                        sync_agent_to_shared(&shared_state, &name, &internal).await;
+                        managed.insert(name.clone(), internal);
+                        let _ = reply.send(Ok(format!("agent '{}' started", name)));
+                      }
+                      Err(e) => {
+                        let _ = reply.send(Err(format!("failed to start '{}': {}", name, e)));
+                      }
+                    }
+                  }
+                  None => {
+                    let _ = reply.send(Err(format!("agent '{}' not found in config", name)));
                   }
                 }
               }
-              None => {
-                let _ = reply.send(Err(format!("agent '{}' not found in config", name)));
-              }
-            }
-          }
-          DaemonCommand::Restart { name, reply } => {
-            if let Some(internal) = managed.remove(&name) {
-              internal.handle.stop().await;
-              shared_state.write().await.agents.remove(&name);
-              info!(agent = %name, "stopped agent for restart");
-            }
+              DaemonCommand::Restart { name, reply } => {
+                if let Some(internal) = managed.remove(&name) {
+                  internal.handle.stop().await;
+                  shared_state.write().await.agents.remove(&name);
+                  info!(agent = %name, "stopped agent for restart");
+                }
 
-            match current_config.agents.iter().find(|a| a.name == name) {
-              Some(agent_config) => {
-                match spawn_managed_agent(agent_config, &config_path, &current_config, state_tx.clone()) {
-                  Ok(internal) => {
-                    info!(agent = %name, "agent restarted via command");
-                    sync_agent_to_shared(&shared_state, &name, &internal).await;
-                    managed.insert(name.clone(), internal);
-                    let _ = reply.send(Ok(format!("agent '{}' restarted", name)));
+                match current_config.agents.iter().find(|a| a.name == name) {
+                  Some(agent_config) => {
+                    match spawn_managed_agent(agent_config, &config_path, &current_config, state_tx.clone()) {
+                      Ok(internal) => {
+                        info!(agent = %name, "agent restarted via command");
+                        sync_agent_to_shared(&shared_state, &name, &internal).await;
+                        managed.insert(name.clone(), internal);
+                        let _ = reply.send(Ok(format!("agent '{}' restarted", name)));
+                      }
+                      Err(e) => {
+                        let _ = reply.send(Err(format!("failed to restart '{}': {}", name, e)));
+                      }
+                    }
                   }
-                  Err(e) => {
-                    let _ = reply.send(Err(format!("failed to restart '{}': {}", name, e)));
+                  None => {
+                    let _ = reply.send(Err(format!("agent '{}' not found in config", name)));
                   }
                 }
               }
-              None => {
-                let _ = reply.send(Err(format!("agent '{}' not found in config", name)));
+              DaemonCommand::SubmitRun { task, reply } => {
+                let run_id = orchestrator.submit_run(task);
+                info!(run_id = %run_id, "new orchestrated run submitted");
+
+                // Spawn ready jobs from the new run
+                while let Some(job) = orchestrator.next_job() {
+                  info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
+                  orchestrator.mark_running(&job.job_id);
+                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
+                }
+
+                // Persist to SQLite
+                if let Some(ref db) = db {
+                  db.persist_run_state(&orchestrator.store, &run_id).ok();
+                }
+
+                let _ = reply.send(Ok(run_id));
+              }
+              DaemonCommand::GetRunStatus { run_id, reply } => {
+                let result = get_run_status_data(&orchestrator, &run_id);
+                let _ = reply.send(result);
+              }
+              DaemonCommand::ListRuns { reply } => {
+                let runs = get_runs_list_data(&orchestrator);
+                let _ = reply.send(Ok(runs));
+              }
+              DaemonCommand::GetRunResult { run_id, reply } => {
+                let result = get_run_result_data(&orchestrator, &run_id);
+                let _ = reply.send(result);
+              }
+              DaemonCommand::CancelRun { run_id, reply } => {
+                let result = cancel_run(&mut orchestrator, &run_id, &mut managed);
+                // Persist cancellation to SQLite
+                if result.is_ok() {
+                  if let Some(ref db) = db {
+                    db.persist_run_state(&orchestrator.store, &run_id).ok();
+                  }
+                }
+                let _ = reply.send(result);
+              }
+              DaemonCommand::GetMetrics { reply } => {
+                let metrics = get_metrics_data(&orchestrator, &managed, &daemon_start);
+                let _ = reply.send(metrics);
               }
             }
           }
-          DaemonCommand::SubmitRun { task, reply } => {
-            let run_id = orchestrator.submit_run(task);
-            info!(run_id = %run_id, "new orchestrated run submitted");
 
-            // Spawn ready jobs from the new run
-            while let Some(job) = orchestrator.next_job() {
-              info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
-              orchestrator.mark_running(&job.job_id);
-              spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
+          // Orchestrator events from job workers
+          Some(event) = orch_event_rx.recv() => {
+            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match event_type {
+              "heartbeat" => {
+                let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+                orchestrator.record_heartbeat(job_id);
+              }
+              "progress" => {
+                let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+                orchestrator.record_heartbeat(job_id);
+                let phase = event.get("phase").and_then(|v| v.as_str()).unwrap_or("");
+                let message = event.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                info!(job_id = %job_id, phase = %phase, message = %message, "job progress");
+              }
+              "job_completed" => {
+                let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let artifacts: Vec<String> = event.get("output_artifact_ids")
+                  .and_then(|v| v.as_array())
+                  .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                  .unwrap_or_default();
+
+                // Check if completed job is a planner — if so, materialize the plan
+                let is_planner = orchestrator.store.get_job(&job_id)
+                  .map(|j| j.role == "planner")
+                  .unwrap_or(false);
+                let run_id = orchestrator.store.get_job(&job_id)
+                  .map(|j| j.run_id.clone())
+                  .unwrap_or_default();
+                managed.remove(&format!("__job_{}", job_id));
+
+                orchestrator.mark_completed(&job_id, artifacts.clone());
+                info!(job_id = %job_id, "job completed");
+
+                if is_planner {
+                  // Read planner output and try to parse as ExecutionPlan
+                  if let Some(artifact) = artifacts.first().and_then(|aid| orchestrator.store.get_artifact(aid)) {
+                    let plan_text = std::fs::read_to_string(&artifact.path).unwrap_or_default();
+                    let json_str = extract_json(&plan_text);
+                    match serde_json::from_str::<crate::orchestrator::types::ExecutionPlan>(&json_str) {
+                      Ok(plan) => {
+                        // Validate the plan before materializing
+                        let validation_errors = crate::orchestrator::planner::validate_plan(&plan);
+                        if validation_errors.is_empty() {
+                          info!(run_id = %run_id, jobs = plan.jobs.len(), "planner produced execution plan");
+                          let new_job_ids = crate::orchestrator::planner::materialize_plan(
+                            &mut orchestrator.store, &run_id, &job_id, &plan
+                          );
+                          for jid in &new_job_ids {
+                            if let Some(j) = orchestrator.store.get_job(jid) {
+                              if j.status == crate::orchestrator::types::JobStatus::Ready {
+                                orchestrator.ready_queue.push_back(jid.clone());
+                              }
+                            }
+                          }
+                        } else {
+                          warn!(
+                            run_id = %run_id,
+                            errors = ?validation_errors,
+                            "planner output failed validation — marking run failed"
+                          );
+                          orchestrator.mark_failed(&job_id, format!("invalid plan: {}", validation_errors.join("; ")));
+                        }
+                      }
+                      Err(e) => {
+                        warn!(
+                          run_id = %run_id,
+                          error = %e,
+                          "failed to parse planner output as JSON — marking run failed"
+                        );
+                        orchestrator.mark_failed(&job_id, format!("malformed plan output: {}", e));
+                      }
+                    }
+                  }
+                }
+
+                // Check if completed job is a reviewer — handle review loop
+                let is_reviewer = orchestrator.store.get_job(&job_id)
+                  .map(|j| j.role == "reviewer")
+                  .unwrap_or(false);
+
+                if is_reviewer {
+                  if let Some(artifact_id) = orchestrator.store.get_job(&job_id)
+                    .and_then(|j| j.output_artifact_ids.first().cloned())
+                  {
+                    if let Some(artifact) = orchestrator.store.get_artifact(&artifact_id) {
+                      let review_text = std::fs::read_to_string(&artifact.path).unwrap_or_default();
+                      let decision = crate::orchestrator::review::parse_review_decision(&review_text);
+                      let max_revisions = current_config.daemon.max_revisions;
+
+                      match &decision {
+                        crate::orchestrator::review::ReviewDecision::Revise { feedback } => {
+                          if let Some((coder_id, reviewer_id)) = orchestrator.handle_review_completion(&job_id, decision.clone(), max_revisions) {
+                            info!(job_id = %job_id, new_coder = %coder_id, new_reviewer = %reviewer_id, "reviewer requested revision — new jobs created");
+                          } else {
+                            info!(job_id = %job_id, feedback = %feedback, "reviewer requested revision but max revisions reached");
+                          }
+                        }
+                        crate::orchestrator::review::ReviewDecision::Approved => {
+                          info!(job_id = %job_id, "reviewer approved");
+                        }
+                        crate::orchestrator::review::ReviewDecision::Rejected { reason } => {
+                          warn!(job_id = %job_id, reason = %reason, "reviewer rejected");
+                        }
+                      }
+                    }
+                  }
+                }
+
+                // Spawn newly ready jobs
+                while let Some(job) = orchestrator.next_job() {
+                  info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
+                  orchestrator.mark_running(&job.job_id);
+                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
+                }
+
+                // Persist run state to SQLite
+                if let Some(ref db) = db {
+                  db.persist_run_state(&orchestrator.store, &run_id).ok();
+                }
+              }
+              "job_failed" => {
+                let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let run_id = orchestrator.store.get_job(&job_id)
+                  .map(|j| j.run_id.clone())
+                  .unwrap_or_default();
+                let error = event.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                managed.remove(&format!("__job_{}", job_id));
+                orchestrator.mark_failed(&job_id, error.to_string());
+                warn!(job_id = %job_id, error = %error, "job failed");
+
+                // Spawn retry if re-queued
+                while let Some(job) = orchestrator.next_job() {
+                  info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry)");
+                  orchestrator.mark_running(&job.job_id);
+                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
+                }
+
+                // Persist to SQLite
+                if let Some(ref db) = db {
+                  db.persist_run_state(&orchestrator.store, &run_id).ok();
+                }
+              }
+              "artifact_produced" => {
+                let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+                let run_id = orchestrator.store.get_job(job_id)
+                  .map(|j| j.run_id.clone())
+                  .unwrap_or_default();
+                let artifact = crate::orchestrator::types::Artifact {
+                  artifact_id: event.get("artifact_id").and_then(|v| v.as_str()).unwrap_or("").into(),
+                  run_id,
+                  job_id: job_id.into(),
+                  kind: event.get("kind").and_then(|v| v.as_str()).unwrap_or("").into(),
+                  path: std::path::PathBuf::from(event.get("path").and_then(|v| v.as_str()).unwrap_or("")),
+                  summary: event.get("summary").and_then(|v| v.as_str()).unwrap_or("").into(),
+                  created_at: std::time::SystemTime::now(),
+                };
+                if let Some(ref db) = db {
+                  db.persist_artifact(&artifact).ok();
+                }
+                orchestrator.store.create_artifact(artifact);
+              }
+              _ => {}
+            }
+          }
+
+          // Poll tick — config reload + restart check
+          _ = poll_timer.tick() => {
+            // Check for config changes
+            if let Ok(new_config) = config::load_config(&config_path) {
+              let new_hash = config::config_hash(&new_config);
+              if new_hash != last_config_hash {
+                info!(old_hash = last_config_hash, new_hash = new_hash, "config change detected");
+                apply_config_changes(&mut managed, &shared_state, &new_config, &config_path, state_tx.clone()).await;
+                current_config = new_config;
+                last_config_hash = new_hash;
+              }
             }
 
-            // Persist to SQLite
-            if let Some(ref db) = db {
-              db.persist_run_state(&orchestrator.store, &run_id).ok();
-            }
+            // Check for stuck orchestrator jobs (no heartbeat for 120s)
+            let stale = orchestrator.stale_jobs(Duration::from_secs(120));
+            for job_id in stale {
+              warn!(job_id = %job_id, "job heartbeat timeout — marking failed");
+              let run_id = orchestrator.store.get_job(&job_id)
+                .map(|j| j.run_id.clone())
+                .unwrap_or_default();
+              // Kill the worker process
+              let worker_name = format!("__job_{}", job_id);
+              if let Some(internal) = managed.get(&worker_name) {
+                internal.handle.stop().await;
+              }
+              managed.remove(&worker_name);
+              orchestrator.mark_failed(&job_id, "heartbeat timeout".into());
 
-            let _ = reply.send(Ok(run_id));
-          }
-          DaemonCommand::GetRunStatus { run_id, reply } => {
-            let result = get_run_status_data(&orchestrator, &run_id);
-            let _ = reply.send(result);
-          }
-          DaemonCommand::ListRuns { reply } => {
-            let runs = get_runs_list_data(&orchestrator);
-            let _ = reply.send(Ok(runs));
-          }
-          DaemonCommand::GetRunResult { run_id, reply } => {
-            let result = get_run_result_data(&orchestrator, &run_id);
-            let _ = reply.send(result);
-          }
-          DaemonCommand::CancelRun { run_id, reply } => {
-            let result = cancel_run(&mut orchestrator, &run_id, &mut managed);
-            // Persist cancellation to SQLite
-            if result.is_ok() {
+              // Spawn retries if re-queued
+              while let Some(job) = orchestrator.next_job() {
+                info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry after timeout)");
+                orchestrator.mark_running(&job.job_id);
+                spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
+              }
+
+              // Persist to SQLite
               if let Some(ref db) = db {
                 db.persist_run_state(&orchestrator.store, &run_id).ok();
               }
             }
-            let _ = reply.send(result);
-          }
-          DaemonCommand::GetMetrics { reply } => {
-            let metrics = get_metrics_data(&orchestrator, &managed, &daemon_start);
-            let _ = reply.send(metrics);
-          }
-        }
-      }
 
-      // Orchestrator events from job workers
-      Some(event) = orch_event_rx.recv() => {
-        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        match event_type {
-          "heartbeat" => {
-            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
-            orchestrator.record_heartbeat(job_id);
-          }
-          "progress" => {
-            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
-            orchestrator.record_heartbeat(job_id);
-            let phase = event.get("phase").and_then(|v| v.as_str()).unwrap_or("");
-            let message = event.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            info!(job_id = %job_id, phase = %phase, message = %message, "job progress");
-          }
-          "job_completed" => {
-            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let artifacts: Vec<String> = event.get("output_artifact_ids")
-              .and_then(|v| v.as_array())
-              .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-              .unwrap_or_default();
+            // TTL-based run cleanup (check once per hour)
+            if current_config.daemon.run_ttl_days > 0
+              && last_cleanup.elapsed() > Duration::from_secs(3600)
+            {
+              last_cleanup = Instant::now();
+              let ttl = Duration::from_secs(current_config.daemon.run_ttl_days as u64 * 86400);
+              let cutoff = std::time::SystemTime::now() - ttl;
+              let expired: Vec<String> = orchestrator.store.list_runs().iter()
+                .filter(|r| {
+                  (r.status == crate::orchestrator::types::RunStatus::Completed
+                    || r.status == crate::orchestrator::types::RunStatus::Failed
+                    || r.status == crate::orchestrator::types::RunStatus::Cancelled)
+                    && r.updated_at < cutoff
+                })
+                .map(|r| r.run_id.clone())
+                .collect();
+              if !expired.is_empty() {
+                for run_id in &expired {
+                  let paths = orchestrator.store.remove_run(run_id);
+                  for path in &paths {
+                    std::fs::remove_file(path).ok();
+                  }
+                  if let Some(ref db) = db {
+                    db.delete_run(run_id).ok();
+                  }
+                }
+                info!(cleaned = expired.len(), "TTL cleanup: removed expired runs");
+              }
+            }
 
-            // Check if completed job is a planner — if so, materialize the plan
-            let is_planner = orchestrator.store.get_job(&job_id)
-              .map(|j| j.role == "planner")
-              .unwrap_or(false);
-            let run_id = orchestrator.store.get_job(&job_id)
-              .map(|j| j.run_id.clone())
-              .unwrap_or_default();
+            // Check for agents that need restarting
+            let now = Instant::now();
+            let restart_names: Vec<String> = managed
+              .iter()
+              .filter(|(_, m)| {
+                m.state.status == AgentStatus::RestartPending
+                  && m.restart_at.map(|t| now >= t).unwrap_or(false)
+              })
+              .map(|(name, _)| name.clone())
+              .collect();
 
-            orchestrator.mark_completed(&job_id, artifacts.clone());
-            info!(job_id = %job_id, "job completed");
+            for name in restart_names {
+              if let Some(agent_config) = current_config.agents.iter().find(|a| a.name == name) {
+                let restart_count = managed.get(&name).map(|m| m.state.restart_count).unwrap_or(0);
+                managed.remove(&name);
 
-            if is_planner {
-              // Read planner output and try to parse as ExecutionPlan
-              if let Some(artifact) = artifacts.first().and_then(|aid| orchestrator.store.get_artifact(aid)) {
-                let plan_text = std::fs::read_to_string(&artifact.path).unwrap_or_default();
-                let json_str = extract_json(&plan_text);
-                match serde_json::from_str::<crate::orchestrator::types::ExecutionPlan>(&json_str) {
-                  Ok(plan) => {
-                    // Validate the plan before materializing
-                    let validation_errors = crate::orchestrator::planner::validate_plan(&plan);
-                    if validation_errors.is_empty() {
-                      info!(run_id = %run_id, jobs = plan.jobs.len(), "planner produced execution plan");
-                      let new_job_ids = crate::orchestrator::planner::materialize_plan(
-                        &mut orchestrator.store, &run_id, &job_id, &plan
-                      );
-                      for jid in &new_job_ids {
-                        if let Some(j) = orchestrator.store.get_job(jid) {
-                          if j.status == crate::orchestrator::types::JobStatus::Ready {
-                            orchestrator.ready_queue.push_back(jid.clone());
-                          }
-                        }
-                      }
-                    } else {
-                      warn!(
-                        run_id = %run_id,
-                        errors = ?validation_errors,
-                        "planner output failed validation — marking run failed"
-                      );
-                      orchestrator.mark_failed(&job_id, format!("invalid plan: {}", validation_errors.join("; ")));
-                    }
+                match spawn_managed_agent(agent_config, &config_path, &current_config, state_tx.clone()) {
+                  Ok(mut internal) => {
+                    internal.state.restart_count = restart_count + 1;
+                    info!(agent = %name, restart = internal.state.restart_count, "agent restarted");
+                    sync_agent_to_shared(&shared_state, &name, &internal).await;
+                    managed.insert(name, internal);
                   }
                   Err(e) => {
-                    warn!(
-                      run_id = %run_id,
-                      error = %e,
-                      "failed to parse planner output as JSON — marking run failed"
-                    );
-                    orchestrator.mark_failed(&job_id, format!("malformed plan output: {}", e));
+                    warn!(agent = %name, error = %e, "restart failed");
                   }
                 }
               }
             }
-
-            // Check if completed job is a reviewer — handle review loop
-            let is_reviewer = orchestrator.store.get_job(&job_id)
-              .map(|j| j.role == "reviewer")
-              .unwrap_or(false);
-
-            if is_reviewer {
-              if let Some(artifact_id) = orchestrator.store.get_job(&job_id)
-                .and_then(|j| j.output_artifact_ids.first().cloned())
-              {
-                if let Some(artifact) = orchestrator.store.get_artifact(&artifact_id) {
-                  let review_text = std::fs::read_to_string(&artifact.path).unwrap_or_default();
-                  let decision = crate::orchestrator::review::parse_review_decision(&review_text);
-                  let max_revisions = current_config.daemon.max_revisions;
-
-                  match &decision {
-                    crate::orchestrator::review::ReviewDecision::Revise { feedback } => {
-                      if let Some((coder_id, reviewer_id)) = orchestrator.handle_review_completion(&job_id, decision.clone(), max_revisions) {
-                        info!(job_id = %job_id, new_coder = %coder_id, new_reviewer = %reviewer_id, "reviewer requested revision — new jobs created");
-                      } else {
-                        info!(job_id = %job_id, feedback = %feedback, "reviewer requested revision but max revisions reached");
-                      }
-                    }
-                    crate::orchestrator::review::ReviewDecision::Approved => {
-                      info!(job_id = %job_id, "reviewer approved");
-                    }
-                    crate::orchestrator::review::ReviewDecision::Rejected { reason } => {
-                      warn!(job_id = %job_id, reason = %reason, "reviewer rejected");
-                    }
-                  }
-                }
-              }
-            }
-
-            // Spawn newly ready jobs
-            while let Some(job) = orchestrator.next_job() {
-              info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
-              orchestrator.mark_running(&job.job_id);
-              spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
-            }
-
-            // Persist run state to SQLite
-            if let Some(ref db) = db {
-              db.persist_run_state(&orchestrator.store, &run_id).ok();
-            }
-          }
-          "job_failed" => {
-            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let run_id = orchestrator.store.get_job(&job_id)
-              .map(|j| j.run_id.clone())
-              .unwrap_or_default();
-            let error = event.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-            orchestrator.mark_failed(&job_id, error.to_string());
-            warn!(job_id = %job_id, error = %error, "job failed");
-
-            // Spawn retry if re-queued
-            while let Some(job) = orchestrator.next_job() {
-              info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry)");
-              orchestrator.mark_running(&job.job_id);
-              spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
-            }
-
-            // Persist to SQLite
-            if let Some(ref db) = db {
-              db.persist_run_state(&orchestrator.store, &run_id).ok();
-            }
-          }
-          "artifact_produced" => {
-            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
-            let run_id = orchestrator.store.get_job(job_id)
-              .map(|j| j.run_id.clone())
-              .unwrap_or_default();
-            let artifact = crate::orchestrator::types::Artifact {
-              artifact_id: event.get("artifact_id").and_then(|v| v.as_str()).unwrap_or("").into(),
-              run_id,
-              job_id: job_id.into(),
-              kind: event.get("kind").and_then(|v| v.as_str()).unwrap_or("").into(),
-              path: std::path::PathBuf::from(event.get("path").and_then(|v| v.as_str()).unwrap_or("")),
-              summary: event.get("summary").and_then(|v| v.as_str()).unwrap_or("").into(),
-              created_at: std::time::SystemTime::now(),
-            };
-            if let Some(ref db) = db {
-              db.persist_artifact(&artifact).ok();
-            }
-            orchestrator.store.create_artifact(artifact);
-          }
-          _ => {}
-        }
-      }
-
-      // Poll tick — config reload + restart check
-      _ = poll_timer.tick() => {
-        // Check for config changes
-        if let Ok(new_config) = config::load_config(&config_path) {
-          let new_hash = config::config_hash(&new_config);
-          if new_hash != last_config_hash {
-            info!(old_hash = last_config_hash, new_hash = new_hash, "config change detected");
-            apply_config_changes(&mut managed, &shared_state, &new_config, &config_path, state_tx.clone()).await;
-            current_config = new_config;
-            last_config_hash = new_hash;
           }
         }
-
-        // Check for stuck orchestrator jobs (no heartbeat for 120s)
-        let stale = orchestrator.stale_jobs(Duration::from_secs(120));
-        for job_id in stale {
-          warn!(job_id = %job_id, "job heartbeat timeout — marking failed");
-          let run_id = orchestrator.store.get_job(&job_id)
-            .map(|j| j.run_id.clone())
-            .unwrap_or_default();
-          // Kill the worker process
-          let worker_name = format!("__job_{}", job_id);
-          if let Some(internal) = managed.get(&worker_name) {
-            internal.handle.stop().await;
-          }
-          orchestrator.mark_failed(&job_id, "heartbeat timeout".into());
-
-          // Spawn retries if re-queued
-          while let Some(job) = orchestrator.next_job() {
-            info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry after timeout)");
-            orchestrator.mark_running(&job.job_id);
-            spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
-          }
-
-          // Persist to SQLite
-          if let Some(ref db) = db {
-            db.persist_run_state(&orchestrator.store, &run_id).ok();
-          }
-        }
-
-        // TTL-based run cleanup (check once per hour)
-        if current_config.daemon.run_ttl_days > 0
-          && last_cleanup.elapsed() > Duration::from_secs(3600)
-        {
-          last_cleanup = Instant::now();
-          let ttl = Duration::from_secs(current_config.daemon.run_ttl_days as u64 * 86400);
-          let cutoff = std::time::SystemTime::now() - ttl;
-          let expired: Vec<String> = orchestrator.store.list_runs().iter()
-            .filter(|r| {
-              (r.status == crate::orchestrator::types::RunStatus::Completed
-                || r.status == crate::orchestrator::types::RunStatus::Failed
-                || r.status == crate::orchestrator::types::RunStatus::Cancelled)
-                && r.updated_at < cutoff
-            })
-            .map(|r| r.run_id.clone())
-            .collect();
-          if !expired.is_empty() {
-            for run_id in &expired {
-              let paths = orchestrator.store.remove_run(run_id);
-              for path in &paths {
-                std::fs::remove_file(path).ok();
-              }
-              if let Some(ref db) = db {
-                db.delete_run(run_id).ok();
-              }
-            }
-            info!(cleaned = expired.len(), "TTL cleanup: removed expired runs");
-          }
-        }
-
-        // Check for agents that need restarting
-        let now = Instant::now();
-        let restart_names: Vec<String> = managed
-          .iter()
-          .filter(|(_, m)| {
-            m.state.status == AgentStatus::RestartPending
-              && m.restart_at.map(|t| now >= t).unwrap_or(false)
-          })
-          .map(|(name, _)| name.clone())
-          .collect();
-
-        for name in restart_names {
-          if let Some(agent_config) = current_config.agents.iter().find(|a| a.name == name) {
-            let restart_count = managed.get(&name).map(|m| m.state.restart_count).unwrap_or(0);
-            managed.remove(&name);
-
-            match spawn_managed_agent(agent_config, &config_path, &current_config, state_tx.clone()) {
-              Ok(mut internal) => {
-                internal.state.restart_count = restart_count + 1;
-                info!(agent = %name, restart = internal.state.restart_count, "agent restarted");
-                sync_agent_to_shared(&shared_state, &name, &internal).await;
-                managed.insert(name, internal);
-              }
-              Err(e) => {
-                warn!(agent = %name, error = %e, "restart failed");
-              }
-            }
-          }
-        }
-      }
     }
-  }
 
-  // Graceful shutdown
-  info!("shutting down...");
+    // Graceful shutdown
+    info!("shutting down...");
 
-  // Cancel all running orchestration jobs
-  let running_run_ids: Vec<String> = orchestrator.store.list_runs().iter()
-    .filter(|r| r.status == crate::orchestrator::types::RunStatus::Running
-      || r.status == crate::orchestrator::types::RunStatus::Pending)
-    .map(|r| r.run_id.clone())
-    .collect();
-  for run_id in &running_run_ids {
-    let _ = cancel_run(&mut orchestrator, run_id, &mut managed);
-    if let Some(ref db) = db {
-      db.persist_run_state(&orchestrator.store, run_id).ok();
+    // Cancel all running orchestration jobs
+    let running_run_ids: Vec<String> = orchestrator
+        .store
+        .list_runs()
+        .iter()
+        .filter(|r| {
+            r.status == crate::orchestrator::types::RunStatus::Running
+                || r.status == crate::orchestrator::types::RunStatus::Pending
+        })
+        .map(|r| r.run_id.clone())
+        .collect();
+    for run_id in &running_run_ids {
+        let _ = cancel_run(&mut orchestrator, run_id, &mut managed);
+        if let Some(ref db) = db {
+            db.persist_run_state(&orchestrator.store, run_id).ok();
+        }
     }
-  }
-  if !running_run_ids.is_empty() {
-    info!(runs = running_run_ids.len(), "cancelled in-flight runs");
-  }
+    if !running_run_ids.is_empty() {
+        info!(runs = running_run_ids.len(), "cancelled in-flight runs");
+    }
 
-  // Stop all agents
-  for (name, internal) in &managed {
-    internal.handle.stop().await;
-    info!(agent = %name, "sent stop to agent");
-  }
+    // Stop all agents
+    for (name, internal) in &managed {
+        internal.handle.stop().await;
+        info!(agent = %name, "sent stop to agent");
+    }
 
-  // Brief wait for processes to exit
-  tokio::time::sleep(Duration::from_secs(2)).await;
-  info!(
-    uptime_secs = daemon_start.elapsed().as_secs(),
-    "zeptopm stopped"
-  );
+    // Brief wait for processes to exit
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    info!(
+        uptime_secs = daemon_start.elapsed().as_secs(),
+        "zeptopm stopped"
+    );
 }
 
 struct InternalAgent {
-  handle: AgentHandle,
-  _join: tokio::task::JoinHandle<()>,
-  state: AgentState,
-  max_restarts: u32,
-  restart_backoff_ms: u64,
-  restart_at: Option<Instant>,
-  gateway: Option<ResolvedGatewayConfig>,
+    handle: AgentHandle,
+    _join: tokio::task::JoinHandle<()>,
+    state: AgentState,
+    max_restarts: u32,
+    restart_backoff_ms: u64,
+    restart_at: Option<Instant>,
+    gateway: Option<ResolvedGatewayConfig>,
 }
 
 async fn sync_agent_to_shared(shared: &SharedState, name: &str, internal: &InternalAgent) {
-  let mut s = shared.write().await;
-  s.agents.insert(
-    name.to_string(),
-    ManagedAgentRef {
-      handle: internal.handle.clone(),
-      state: internal.state.clone(),
-      gateway: internal.gateway.clone(),
-    },
-  );
+    let mut s = shared.write().await;
+    s.agents.insert(
+        name.to_string(),
+        ManagedAgentRef {
+            handle: internal.handle.clone(),
+            state: internal.state.clone(),
+            gateway: internal.gateway.clone(),
+        },
+    );
 }
 
 fn spawn_managed_agent(
-  agent_config: &crate::config::AgentConfig,
-  config_path: &str,
-  _config: &Config,
-  state_tx: mpsc::Sender<AgentStateUpdate>,
+    agent_config: &crate::config::AgentConfig,
+    config_path: &str,
+    _config: &Config,
+    state_tx: mpsc::Sender<AgentStateUpdate>,
 ) -> Result<InternalAgent, String> {
-  let (handle, join) = spawn_agent(&agent_config.name, config_path, state_tx);
+    let (handle, join) = spawn_agent(&agent_config.name, config_path, state_tx);
 
-  let gateway = agent_config.gateway.as_ref().map(|gw| ResolvedGatewayConfig {
-    enabled: gw.enabled,
-    api_key: gw.resolve_api_key(),
-    rate_limit: gw.rate_limit,
-  });
+    let gateway = agent_config
+        .gateway
+        .as_ref()
+        .map(|gw| ResolvedGatewayConfig {
+            enabled: gw.enabled,
+            api_key: gw.resolve_api_key(),
+            rate_limit: gw.rate_limit,
+        });
 
-  Ok(InternalAgent {
-    handle,
-    _join: join,
-    state: AgentState {
-      name: agent_config.name.clone(),
-      status: AgentStatus::Starting,
-      restart_count: 0,
-      started_at: Some(Instant::now()),
-      last_error: None,
-      messages_handled: 0,
-      tokens_used: 0,
-      logs: vec![],
-      pid: None,
-    },
-    max_restarts: agent_config.max_restarts,
-    restart_backoff_ms: agent_config.restart_backoff_ms,
-    restart_at: None,
-    gateway,
-  })
+    Ok(InternalAgent {
+        handle,
+        _join: join,
+        state: AgentState {
+            name: agent_config.name.clone(),
+            status: AgentStatus::Starting,
+            restart_count: 0,
+            started_at: Some(Instant::now()),
+            last_error: None,
+            messages_handled: 0,
+            tokens_used: 0,
+            logs: vec![],
+            pid: None,
+        },
+        max_restarts: agent_config.max_restarts,
+        restart_backoff_ms: agent_config.restart_backoff_ms,
+        restart_at: None,
+        gateway,
+    })
 }
 
 async fn apply_config_changes(
-  managed: &mut HashMap<String, InternalAgent>,
-  shared_state: &SharedState,
-  new_config: &Config,
-  config_path: &str,
-  state_tx: mpsc::Sender<AgentStateUpdate>,
+    managed: &mut HashMap<String, InternalAgent>,
+    shared_state: &SharedState,
+    new_config: &Config,
+    config_path: &str,
+    state_tx: mpsc::Sender<AgentStateUpdate>,
 ) {
-  let running_names: std::collections::HashSet<String> =
-    managed.keys().cloned().collect();
-  let new_names: std::collections::HashSet<String> = new_config
-    .agents
-    .iter()
-    .filter(|a| a.auto_start)
-    .map(|a| a.name.clone())
-    .collect();
+    let running_names: std::collections::HashSet<String> = managed.keys().cloned().collect();
+    let new_names: std::collections::HashSet<String> = new_config
+        .agents
+        .iter()
+        .filter(|a| a.auto_start)
+        .map(|a| a.name.clone())
+        .collect();
 
-  // Remove agents no longer in config
-  let to_remove: Vec<String> = running_names
-    .difference(&new_names)
-    .cloned()
-    .collect();
-  for name in &to_remove {
-    if let Some(internal) = managed.remove(name) {
-      internal.handle.stop().await;
-      shared_state.write().await.agents.remove(name);
-      info!(agent = %name, "removed agent (config change)");
+    // Remove agents no longer in config
+    let to_remove: Vec<String> = running_names.difference(&new_names).cloned().collect();
+    for name in &to_remove {
+        if let Some(internal) = managed.remove(name) {
+            internal.handle.stop().await;
+            shared_state.write().await.agents.remove(name);
+            info!(agent = %name, "removed agent (config change)");
+        }
     }
-  }
 
-  // Add new agents
-  for agent_config in &new_config.agents {
-    if !agent_config.auto_start {
-      continue;
+    // Add new agents
+    for agent_config in &new_config.agents {
+        if !agent_config.auto_start {
+            continue;
+        }
+        if managed.contains_key(&agent_config.name) {
+            continue;
+        }
+        match spawn_managed_agent(agent_config, config_path, new_config, state_tx.clone()) {
+            Ok(internal) => {
+                info!(agent = %agent_config.name, "added agent (config change)");
+                sync_agent_to_shared(shared_state, &agent_config.name, &internal).await;
+                managed.insert(agent_config.name.clone(), internal);
+            }
+            Err(e) => {
+                warn!(agent = %agent_config.name, error = %e, "failed to add agent");
+            }
+        }
     }
-    if managed.contains_key(&agent_config.name) {
-      continue;
-    }
-    match spawn_managed_agent(agent_config, config_path, new_config, state_tx.clone()) {
-      Ok(internal) => {
-        info!(agent = %agent_config.name, "added agent (config change)");
-        sync_agent_to_shared(shared_state, &agent_config.name, &internal).await;
-        managed.insert(agent_config.name.clone(), internal);
-      }
-      Err(e) => {
-        warn!(agent = %agent_config.name, error = %e, "failed to add agent");
-      }
-    }
-  }
 
-  let prev_count = running_names.len();
-  if !to_remove.is_empty() || managed.len() != prev_count {
-    info!(total = managed.len(), "config reload complete");
-  }
+    let prev_count = running_names.len();
+    if !to_remove.is_empty() || managed.len() != prev_count {
+        info!(total = managed.len(), "config reload complete");
+    }
 }
 
 /// Spawn a temporary worker process for an orchestration job.
 /// When isolation = "capsule", uses ZeptoKernel capsule. Otherwise spawns bare child process.
 async fn spawn_job_worker(
-  job: &crate::orchestrator::types::Job,
-  config_path: &str,
-  config: &Config,
-  state_tx: mpsc::Sender<AgentStateUpdate>,
-  orch_event_tx: mpsc::Sender<serde_json::Value>,
-  _managed: &mut HashMap<String, InternalAgent>,
-  _shared_state: &SharedState,
-  orchestrator_store: &crate::orchestrator::store::RunStore,
+    job: &crate::orchestrator::types::Job,
+    config_path: &str,
+    config: &Config,
+    state_tx: mpsc::Sender<AgentStateUpdate>,
+    orch_event_tx: mpsc::Sender<serde_json::Value>,
+    _managed: &mut HashMap<String, InternalAgent>,
+    _shared_state: &SharedState,
+    orchestrator_store: &crate::orchestrator::store::RunStore,
 ) {
-  // Capsule / process / namespace mode — delegate to ZeptoKernel
-  if matches!(config.daemon.isolation.as_str(), "capsule" | "process" | "namespace") {
-    crate::capsule::spawn_capsule_job(job, config, orch_event_tx, orchestrator_store).await;
-    return;
-  }
-
-  // Find an agent config matching the job's role/profile_id
-  let agent_config = match config.agents.iter().find(|a| a.name == job.profile_id) {
-    Some(c) => c,
-    None => {
-      warn!(job_id = %job.job_id, profile = %job.profile_id, "no agent profile found for job");
-      let _ = orch_event_tx.send(serde_json::json!({
-        "type": "job_failed",
-        "job_id": job.job_id,
-        "error": format!("no agent profile '{}' found in config", job.profile_id),
-        "retryable": false
-      })).await;
-      return;
+    // Capsule / process / namespace mode — delegate to ZeptoKernel
+    if matches!(
+        config.daemon.isolation.as_str(),
+        "capsule" | "process" | "namespace"
+    ) {
+        let (handle, join) =
+            crate::capsule::spawn_capsule_job(job, config, orch_event_tx, orchestrator_store);
+        let worker_name = format!("__job_{}", job.job_id);
+        _managed.insert(
+            worker_name,
+            InternalAgent {
+                handle,
+                _join: join,
+                state: AgentState {
+                    name: job.job_id.clone(),
+                    status: AgentStatus::Running,
+                    restart_count: 0,
+                    started_at: Some(Instant::now()),
+                    last_error: None,
+                    messages_handled: 0,
+                    tokens_used: 0,
+                    logs: vec![],
+                    pid: None,
+                },
+                max_restarts: 0,
+                restart_backoff_ms: 1000,
+                restart_at: None,
+                gateway: None,
+            },
+        );
+        return;
     }
-  };
 
-  // Spawn a worker using the matching agent profile
-  let (handle, join) = crate::agent::spawn_agent_with_orch(
-    &agent_config.name,
-    config_path,
-    state_tx.clone(),
-    Some(orch_event_tx.clone()),
-  );
+    // Find an agent config matching the job's role/profile_id
+    let agent_config = match config.agents.iter().find(|a| a.name == job.profile_id) {
+        Some(c) => c,
+        None => {
+            warn!(job_id = %job.job_id, profile = %job.profile_id, "no agent profile found for job");
+            let _ = orch_event_tx
+                .send(serde_json::json!({
+                  "type": "job_failed",
+                  "job_id": job.job_id,
+                  "error": format!("no agent profile '{}' found in config", job.profile_id),
+                  "retryable": false
+                }))
+                .await;
+            return;
+        }
+    };
 
-  // Collect input artifact paths from completed dependencies
-  let input_artifacts: Vec<String> = job.input_artifact_ids.iter()
-    .filter_map(|aid| orchestrator_store.get_artifact(aid))
-    .map(|a| a.path.to_string_lossy().to_string())
-    .collect();
+    // Spawn a worker using the matching agent profile
+    let (handle, join) = crate::agent::spawn_agent_with_orch(
+        &agent_config.name,
+        config_path,
+        state_tx.clone(),
+        Some(orch_event_tx.clone()),
+    );
 
-  // Send job_execute command — the worker will emit job_completed/job_failed events
-  let _ = handle.send_job(
-    job.job_id.clone(),
-    job.instruction.clone(),
-    job.workspace_dir.to_string_lossy().to_string(),
-    input_artifacts,
-  ).await;
+    // Collect input artifact paths from completed dependencies
+    let input_artifacts: Vec<String> = job
+        .input_artifact_ids
+        .iter()
+        .filter_map(|aid| orchestrator_store.get_artifact(aid))
+        .map(|a| a.path.to_string_lossy().to_string())
+        .collect();
 
-  // Store the handle to keep the bridge alive until the job completes.
-  // Using a unique name to avoid collisions with regular agents.
-  let worker_name = format!("__job_{}", job.job_id);
-  _managed.insert(worker_name, InternalAgent {
-    handle,
-    _join: join,
-    state: AgentState {
-      name: job.job_id.clone(),
-      status: AgentStatus::Running,
-      restart_count: 0,
-      started_at: Some(Instant::now()),
-      last_error: None,
-      messages_handled: 0,
-      tokens_used: 0,
-      logs: vec![],
-      pid: None,
-    },
-    max_restarts: 0,
-    restart_backoff_ms: 1000,
-    restart_at: None,
-    gateway: None,
-  });
+    // Send job_execute command — the worker will emit job_completed/job_failed events
+    let _ = handle
+        .send_job(
+            job.job_id.clone(),
+            job.instruction.clone(),
+            job.workspace_dir.to_string_lossy().to_string(),
+            input_artifacts,
+        )
+        .await;
+
+    // Store the handle to keep the bridge alive until the job completes.
+    // Using a unique name to avoid collisions with regular agents.
+    let worker_name = format!("__job_{}", job.job_id);
+    _managed.insert(
+        worker_name,
+        InternalAgent {
+            handle,
+            _join: join,
+            state: AgentState {
+                name: job.job_id.clone(),
+                status: AgentStatus::Running,
+                restart_count: 0,
+                started_at: Some(Instant::now()),
+                last_error: None,
+                messages_handled: 0,
+                tokens_used: 0,
+                logs: vec![],
+                pid: None,
+            },
+            max_restarts: 0,
+            restart_backoff_ms: 1000,
+            restart_at: None,
+            gateway: None,
+        },
+    );
 }
 
 fn get_run_status_data(
-  orchestrator: &OrchestratorEngine,
-  run_id: &str,
+    orchestrator: &OrchestratorEngine,
+    run_id: &str,
 ) -> Result<serde_json::Value, String> {
-  let run = orchestrator.store.get_run(run_id)
-    .ok_or_else(|| format!("run '{}' not found", run_id))?;
+    let run = orchestrator
+        .store
+        .get_run(run_id)
+        .ok_or_else(|| format!("run '{}' not found", run_id))?;
 
-  let jobs = orchestrator.store.list_run_jobs(run_id);
-  let now = Instant::now();
-  let job_infos: Vec<serde_json::Value> = jobs.iter().map(|j| {
-    let last_hb_secs = orchestrator.last_heartbeat.get(&j.job_id)
-      .map(|t| now.duration_since(*t).as_secs());
-    serde_json::json!({
-      "job_id": j.job_id,
-      "role": j.role,
-      "status": format!("{:?}", j.status),
-      "instruction": j.instruction.chars().take(100).collect::<String>(),
-      "attempt": j.attempt,
-      "revision_round": j.revision_round,
-      "error": j.error,
-      "last_heartbeat_secs_ago": last_hb_secs,
-    })
-  }).collect();
+    let jobs = orchestrator.store.list_run_jobs(run_id);
+    let now = Instant::now();
+    let job_infos: Vec<serde_json::Value> = jobs
+        .iter()
+        .map(|j| {
+            let last_hb_secs = orchestrator
+                .last_heartbeat
+                .get(&j.job_id)
+                .map(|t| now.duration_since(*t).as_secs());
+            serde_json::json!({
+              "job_id": j.job_id,
+              "role": j.role,
+              "status": format!("{:?}", j.status),
+              "instruction": j.instruction.chars().take(100).collect::<String>(),
+              "attempt": j.attempt,
+              "revision_round": j.revision_round,
+              "error": j.error,
+              "last_heartbeat_secs_ago": last_hb_secs,
+            })
+        })
+        .collect();
 
-  Ok(serde_json::json!({
-    "run_id": run.run_id,
-    "task": run.task,
-    "status": format!("{:?}", run.status),
-    "jobs": job_infos,
-  }))
+    Ok(serde_json::json!({
+      "run_id": run.run_id,
+      "task": run.task,
+      "status": format!("{:?}", run.status),
+      "jobs": job_infos,
+    }))
 }
 
 /// Extract JSON from text that may be wrapped in markdown code blocks.
 fn extract_json(text: &str) -> String {
-  let trimmed = text.trim();
-  // Try to find JSON block in markdown
-  if let Some(start) = trimmed.find("```json") {
-    let after = &trimmed[start + 7..];
-    if let Some(end) = after.find("```") {
-      return after[..end].trim().to_string();
+    let trimmed = text.trim();
+    // Try to find JSON block in markdown
+    if let Some(start) = trimmed.find("```json") {
+        let after = &trimmed[start + 7..];
+        if let Some(end) = after.find("```") {
+            return after[..end].trim().to_string();
+        }
     }
-  }
-  if let Some(start) = trimmed.find("```") {
-    let after = &trimmed[start + 3..];
-    if let Some(end) = after.find("```") {
-      return after[..end].trim().to_string();
+    if let Some(start) = trimmed.find("```") {
+        let after = &trimmed[start + 3..];
+        if let Some(end) = after.find("```") {
+            return after[..end].trim().to_string();
+        }
     }
-  }
-  // Try to find raw JSON object
-  if let Some(start) = trimmed.find('{') {
-    if let Some(end) = trimmed.rfind('}') {
-      return trimmed[start..=end].to_string();
+    // Try to find raw JSON object
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            return trimmed[start..=end].to_string();
+        }
     }
-  }
-  trimmed.to_string()
+    trimmed.to_string()
 }
 
 /// Get the final artifact content for a completed run.
 fn get_run_result_data(
-  orchestrator: &OrchestratorEngine,
-  run_id: &str,
+    orchestrator: &OrchestratorEngine,
+    run_id: &str,
 ) -> Result<serde_json::Value, String> {
-  let run = orchestrator.store.get_run(run_id)
-    .ok_or_else(|| format!("run '{}' not found", run_id))?;
+    let run = orchestrator
+        .store
+        .get_run(run_id)
+        .ok_or_else(|| format!("run '{}' not found", run_id))?;
 
-  // Collect final artifacts (from completed jobs with no dependents)
-  let jobs = orchestrator.store.list_run_jobs(run_id);
-  let mut artifacts = Vec::new();
+    // Collect final artifacts (from completed jobs with no dependents)
+    let jobs = orchestrator.store.list_run_jobs(run_id);
+    let mut artifacts = Vec::new();
 
-  for job in &jobs {
-    if job.status == crate::orchestrator::types::JobStatus::Completed {
-      for aid in &job.output_artifact_ids {
-        if let Some(artifact) = orchestrator.store.get_artifact(aid) {
-          let content = std::fs::read_to_string(&artifact.path).ok();
-          artifacts.push(serde_json::json!({
-            "artifact_id": artifact.artifact_id,
-            "job_id": artifact.job_id,
-            "kind": artifact.kind,
-            "path": artifact.path.to_string_lossy(),
-            "summary": artifact.summary,
-            "content": content,
-          }));
+    for job in &jobs {
+        if job.status == crate::orchestrator::types::JobStatus::Completed {
+            for aid in &job.output_artifact_ids {
+                if let Some(artifact) = orchestrator.store.get_artifact(aid) {
+                    let content = std::fs::read_to_string(&artifact.path).ok();
+                    artifacts.push(serde_json::json!({
+                      "artifact_id": artifact.artifact_id,
+                      "job_id": artifact.job_id,
+                      "kind": artifact.kind,
+                      "path": artifact.path.to_string_lossy(),
+                      "summary": artifact.summary,
+                      "content": content,
+                    }));
+                }
+            }
         }
-      }
     }
-  }
 
-  Ok(serde_json::json!({
-    "run_id": run.run_id,
-    "task": run.task,
-    "status": format!("{:?}", run.status),
-    "artifacts": artifacts,
-  }))
+    Ok(serde_json::json!({
+      "run_id": run.run_id,
+      "task": run.task,
+      "status": format!("{:?}", run.status),
+      "artifacts": artifacts,
+    }))
 }
 
 /// Cancel a running run — kill active workers, mark jobs failed.
 fn cancel_run(
-  orchestrator: &mut OrchestratorEngine,
-  run_id: &str,
-  managed: &mut HashMap<String, InternalAgent>,
+    orchestrator: &mut OrchestratorEngine,
+    run_id: &str,
+    managed: &mut HashMap<String, InternalAgent>,
 ) -> Result<String, String> {
-  let run = orchestrator.store.get_run(run_id)
-    .ok_or_else(|| format!("run '{}' not found", run_id))?;
+    let run = orchestrator
+        .store
+        .get_run(run_id)
+        .ok_or_else(|| format!("run '{}' not found", run_id))?;
 
-  if run.status != crate::orchestrator::types::RunStatus::Running
-    && run.status != crate::orchestrator::types::RunStatus::Pending
-  {
-    return Err(format!("run '{}' is already {:?}", run_id, run.status));
-  }
-
-  // Collect job IDs and their statuses first to avoid borrow conflicts
-  let jobs_to_cancel: Vec<(String, crate::orchestrator::types::JobStatus)> = orchestrator
-    .store
-    .list_run_jobs(run_id)
-    .iter()
-    .map(|j| (j.job_id.clone(), j.status.clone()))
-    .collect();
-
-  let mut cancelled = 0u32;
-
-  for (job_id, status) in &jobs_to_cancel {
-    match status {
-      crate::orchestrator::types::JobStatus::Running => {
-        // Kill the worker process
-        let worker_name = format!("__job_{}", job_id);
-        if let Some(internal) = managed.get(&worker_name) {
-          let handle = internal.handle.clone();
-          tokio::spawn(async move { handle.stop().await; });
-        }
-        orchestrator.mark_failed(job_id, "cancelled by user".into());
-        cancelled += 1;
-      }
-      crate::orchestrator::types::JobStatus::Ready
-      | crate::orchestrator::types::JobStatus::Pending => {
-        orchestrator.mark_failed(job_id, "cancelled by user".into());
-        cancelled += 1;
-      }
-      _ => {}
+    if run.status != crate::orchestrator::types::RunStatus::Running
+        && run.status != crate::orchestrator::types::RunStatus::Pending
+    {
+        return Err(format!("run '{}' is already {:?}", run_id, run.status));
     }
-  }
 
-  // Drain the ready queue for this run
-  let run_id_owned = run_id.to_string();
-  orchestrator.ready_queue.retain(|jid| {
-    orchestrator.store.get_job(jid)
-      .map(|j| j.run_id != run_id_owned)
-      .unwrap_or(true)
-  });
+    // Collect job IDs and their statuses first to avoid borrow conflicts
+    let jobs_to_cancel: Vec<(String, crate::orchestrator::types::JobStatus)> = orchestrator
+        .store
+        .list_run_jobs(run_id)
+        .iter()
+        .map(|j| (j.job_id.clone(), j.status.clone()))
+        .collect();
 
-  // Mark run as cancelled
-  if let Some(run) = orchestrator.store.get_run_mut(run_id) {
-    run.status = crate::orchestrator::types::RunStatus::Cancelled;
-    run.updated_at = std::time::SystemTime::now();
-  }
+    let mut cancelled = 0u32;
 
-  info!(run_id = %run_id, cancelled_jobs = cancelled, "run cancelled");
-  Ok(format!("run '{}' cancelled ({} jobs cancelled)", run_id, cancelled))
+    for (job_id, status) in &jobs_to_cancel {
+        match status {
+            crate::orchestrator::types::JobStatus::Running => {
+                // Kill the worker process
+                let worker_name = format!("__job_{}", job_id);
+                if let Some(internal) = managed.get(&worker_name) {
+                    let handle = internal.handle.clone();
+                    tokio::spawn(async move {
+                        handle.stop().await;
+                    });
+                }
+                managed.remove(&worker_name);
+                orchestrator.mark_failed(job_id, "cancelled by user".into());
+                cancelled += 1;
+            }
+            crate::orchestrator::types::JobStatus::Ready
+            | crate::orchestrator::types::JobStatus::Pending => {
+                orchestrator.mark_failed(job_id, "cancelled by user".into());
+                cancelled += 1;
+            }
+            _ => {}
+        }
+    }
+
+    // Drain the ready queue for this run
+    let run_id_owned = run_id.to_string();
+    orchestrator.ready_queue.retain(|jid| {
+        orchestrator
+            .store
+            .get_job(jid)
+            .map(|j| j.run_id != run_id_owned)
+            .unwrap_or(true)
+    });
+
+    // Mark run as cancelled
+    if let Some(run) = orchestrator.store.get_run_mut(run_id) {
+        run.status = crate::orchestrator::types::RunStatus::Cancelled;
+        run.updated_at = std::time::SystemTime::now();
+    }
+
+    info!(run_id = %run_id, cancelled_jobs = cancelled, "run cancelled");
+    Ok(format!(
+        "run '{}' cancelled ({} jobs cancelled)",
+        run_id, cancelled
+    ))
 }
 
 /// Get daemon metrics.
 fn get_metrics_data(
-  orchestrator: &OrchestratorEngine,
-  managed: &HashMap<String, InternalAgent>,
-  daemon_start: &Instant,
+    orchestrator: &OrchestratorEngine,
+    managed: &HashMap<String, InternalAgent>,
+    daemon_start: &Instant,
 ) -> serde_json::Value {
-  let agent_count = managed.keys().filter(|k| !k.starts_with("__job_")).count();
-  let worker_count = managed.keys().filter(|k| k.starts_with("__job_")).count();
-  let runs = orchestrator.store.list_runs();
-  let total_runs = runs.len();
-  let running_runs = runs.iter().filter(|r| r.status == crate::orchestrator::types::RunStatus::Running).count();
-  let completed_runs = runs.iter().filter(|r| r.status == crate::orchestrator::types::RunStatus::Completed).count();
-  let failed_runs = runs.iter().filter(|r| r.status == crate::orchestrator::types::RunStatus::Failed).count();
-  let pending_jobs = orchestrator.ready_queue.len();
+    let agent_count = managed.keys().filter(|k| !k.starts_with("__job_")).count();
+    let worker_count = managed.keys().filter(|k| k.starts_with("__job_")).count();
+    let runs = orchestrator.store.list_runs();
+    let total_runs = runs.len();
+    let running_runs = runs
+        .iter()
+        .filter(|r| r.status == crate::orchestrator::types::RunStatus::Running)
+        .count();
+    let completed_runs = runs
+        .iter()
+        .filter(|r| r.status == crate::orchestrator::types::RunStatus::Completed)
+        .count();
+    let failed_runs = runs
+        .iter()
+        .filter(|r| r.status == crate::orchestrator::types::RunStatus::Failed)
+        .count();
+    let pending_jobs = orchestrator.ready_queue.len();
 
-  serde_json::json!({
-    "uptime_secs": daemon_start.elapsed().as_secs(),
-    "agents": agent_count,
-    "active_workers": worker_count,
-    "runs": {
-      "total": total_runs,
-      "running": running_runs,
-      "completed": completed_runs,
-      "failed": failed_runs,
-    },
-    "pending_jobs": pending_jobs,
-  })
+    serde_json::json!({
+      "uptime_secs": daemon_start.elapsed().as_secs(),
+      "agents": agent_count,
+      "active_workers": worker_count,
+      "runs": {
+        "total": total_runs,
+        "running": running_runs,
+        "completed": completed_runs,
+        "failed": failed_runs,
+      },
+      "pending_jobs": pending_jobs,
+    })
 }
 
 fn get_runs_list_data(orchestrator: &OrchestratorEngine) -> serde_json::Value {
-  let runs: Vec<serde_json::Value> = orchestrator.store.list_runs().iter().map(|r| {
-    serde_json::json!({
-      "run_id": r.run_id,
-      "task": r.task,
-      "status": format!("{:?}", r.status),
-    })
-  }).collect();
-  serde_json::json!({ "runs": runs })
+    let runs: Vec<serde_json::Value> = orchestrator
+        .store
+        .list_runs()
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+              "run_id": r.run_id,
+              "task": r.task,
+              "status": format!("{:?}", r.status),
+            })
+        })
+        .collect();
+    serde_json::json!({ "runs": runs })
 }

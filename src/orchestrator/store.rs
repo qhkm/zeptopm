@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::orchestrator::types::*;
+use std::collections::HashMap;
 
 pub struct RunStore {
     runs: HashMap<RunId, Run>,
@@ -57,7 +57,8 @@ impl RunStore {
     }
 
     pub fn create_artifact(&mut self, artifact: Artifact) {
-        self.artifacts.insert(artifact.artifact_id.clone(), artifact);
+        self.artifacts
+            .insert(artifact.artifact_id.clone(), artifact);
     }
 
     pub fn get_artifact(&self, artifact_id: &str) -> Option<&Artifact> {
@@ -67,14 +68,18 @@ impl RunStore {
     /// Remove a run and all its jobs and artifacts. Returns artifact paths for cleanup.
     pub fn remove_run(&mut self, run_id: &str) -> Vec<std::path::PathBuf> {
         self.runs.remove(run_id);
-        let job_ids: Vec<String> = self.jobs.values()
+        let job_ids: Vec<String> = self
+            .jobs
+            .values()
             .filter(|j| j.run_id == run_id)
             .map(|j| j.job_id.clone())
             .collect();
         for jid in &job_ids {
             self.jobs.remove(jid);
         }
-        let artifact_ids: Vec<String> = self.artifacts.values()
+        let artifact_ids: Vec<String> = self
+            .artifacts
+            .values()
             .filter(|a| a.run_id == run_id)
             .map(|a| a.artifact_id.clone())
             .collect();

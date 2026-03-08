@@ -79,12 +79,8 @@ fn test_full_run_lifecycle() {
     engine.mark_completed(&planner_job.job_id, vec![plan_artifact_id]);
 
     // Step 4: Materialize the plan (simulating what the daemon does)
-    let new_job_ids = planner::materialize_plan(
-        &mut engine.store,
-        &run_id,
-        &planner_job.job_id,
-        &plan,
-    );
+    let new_job_ids =
+        planner::materialize_plan(&mut engine.store, &run_id, &planner_job.job_id, &plan);
     assert_eq!(new_job_ids.len(), 2);
 
     // Promote ready jobs
@@ -127,15 +123,13 @@ fn test_full_run_lifecycle() {
 #[test]
 fn test_invalid_plan_rejected() {
     let plan = ExecutionPlan {
-        jobs: vec![
-            PlannedJob {
-                local_id: "a".into(),
-                role: "coder".into(),
-                profile_id: "coder".into(),
-                instruction: "Do something".into(),
-                depends_on: vec!["missing_dep".into()],
-            },
-        ],
+        jobs: vec![PlannedJob {
+            local_id: "a".into(),
+            role: "coder".into(),
+            profile_id: "coder".into(),
+            instruction: "Do something".into(),
+            depends_on: vec!["missing_dep".into()],
+        }],
     };
     let errors = planner::validate_plan(&plan);
     assert!(!errors.is_empty());
@@ -181,9 +175,7 @@ fn test_parallel_execution() {
     assert!(planner::validate_plan(&plan).is_empty());
     engine.mark_completed(&planner.job_id, vec![]);
 
-    let new_ids = planner::materialize_plan(
-        &mut engine.store, &run_id, &planner.job_id, &plan,
-    );
+    let new_ids = planner::materialize_plan(&mut engine.store, &run_id, &planner.job_id, &plan);
     for jid in &new_ids {
         if let Some(j) = engine.store.get_job(jid) {
             if j.status == JobStatus::Ready {

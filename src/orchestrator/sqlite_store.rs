@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::orchestrator::types::*;
 
@@ -82,13 +82,13 @@ impl SqlitePersistence {
                 path TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 created_at REAL NOT NULL
-            );"
+            );",
         )?;
 
         // Set schema version if not exists
-        let count: u32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM schema_version", [], |r| r.get(0)
-        )?;
+        let count: u32 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))?;
         if count == 0 {
             self.conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",
@@ -178,18 +178,20 @@ impl SqlitePersistence {
             "SELECT run_id, task, status, created_at, updated_at, root_job_id, final_artifact_ids, metadata
              FROM runs"
         )?;
-        let runs = stmt.query_map([], |row| {
-            Ok(Run {
-                run_id: row.get(0)?,
-                task: row.get(1)?,
-                status: parse_run_status(&row.get::<_, String>(2)?),
-                created_at: from_epoch(row.get(3)?),
-                updated_at: from_epoch(row.get(4)?),
-                root_job_id: row.get(5)?,
-                final_artifact_ids: parse_json_vec(&row.get::<_, String>(6)?),
-                metadata: parse_json_map(&row.get::<_, String>(7)?),
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let runs = stmt
+            .query_map([], |row| {
+                Ok(Run {
+                    run_id: row.get(0)?,
+                    task: row.get(1)?,
+                    status: parse_run_status(&row.get::<_, String>(2)?),
+                    created_at: from_epoch(row.get(3)?),
+                    updated_at: from_epoch(row.get(4)?),
+                    root_job_id: row.get(5)?,
+                    final_artifact_ids: parse_json_vec(&row.get::<_, String>(6)?),
+                    metadata: parse_json_map(&row.get::<_, String>(7)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(runs)
     }
 
@@ -199,50 +201,54 @@ impl SqlitePersistence {
                     input_artifact_ids, depends_on, children, profile_id, workspace_dir,
                     attempt, max_attempts, revision_round, created_at, started_at, finished_at,
                     output_artifact_ids, error
-             FROM jobs"
+             FROM jobs",
         )?;
-        let jobs = stmt.query_map([], |row| {
-            Ok(Job {
-                job_id: row.get(0)?,
-                run_id: row.get(1)?,
-                parent_job_id: row.get(2)?,
-                role: row.get(3)?,
-                status: parse_job_status(&row.get::<_, String>(4)?),
-                instruction: row.get(5)?,
-                input_artifact_ids: parse_json_vec(&row.get::<_, String>(6)?),
-                depends_on: parse_json_vec(&row.get::<_, String>(7)?),
-                children: parse_json_vec(&row.get::<_, String>(8)?),
-                profile_id: row.get(9)?,
-                workspace_dir: PathBuf::from(row.get::<_, String>(10)?),
-                attempt: row.get(11)?,
-                max_attempts: row.get(12)?,
-                revision_round: row.get(13)?,
-                created_at: from_epoch(row.get(14)?),
-                started_at: row.get::<_, Option<f64>>(15)?.map(from_epoch),
-                finished_at: row.get::<_, Option<f64>>(16)?.map(from_epoch),
-                output_artifact_ids: parse_json_vec(&row.get::<_, String>(17)?),
-                error: row.get(18)?,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let jobs = stmt
+            .query_map([], |row| {
+                Ok(Job {
+                    job_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    parent_job_id: row.get(2)?,
+                    role: row.get(3)?,
+                    status: parse_job_status(&row.get::<_, String>(4)?),
+                    instruction: row.get(5)?,
+                    input_artifact_ids: parse_json_vec(&row.get::<_, String>(6)?),
+                    depends_on: parse_json_vec(&row.get::<_, String>(7)?),
+                    children: parse_json_vec(&row.get::<_, String>(8)?),
+                    profile_id: row.get(9)?,
+                    workspace_dir: PathBuf::from(row.get::<_, String>(10)?),
+                    attempt: row.get(11)?,
+                    max_attempts: row.get(12)?,
+                    revision_round: row.get(13)?,
+                    created_at: from_epoch(row.get(14)?),
+                    started_at: row.get::<_, Option<f64>>(15)?.map(from_epoch),
+                    finished_at: row.get::<_, Option<f64>>(16)?.map(from_epoch),
+                    output_artifact_ids: parse_json_vec(&row.get::<_, String>(17)?),
+                    error: row.get(18)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(jobs)
     }
 
     pub fn load_artifacts(&self) -> Result<Vec<Artifact>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT artifact_id, run_id, job_id, kind, path, summary, created_at
-             FROM artifacts"
+             FROM artifacts",
         )?;
-        let artifacts = stmt.query_map([], |row| {
-            Ok(Artifact {
-                artifact_id: row.get(0)?,
-                run_id: row.get(1)?,
-                job_id: row.get(2)?,
-                kind: row.get(3)?,
-                path: PathBuf::from(row.get::<_, String>(4)?),
-                summary: row.get(5)?,
-                created_at: from_epoch(row.get(6)?),
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let artifacts = stmt
+            .query_map([], |row| {
+                Ok(Artifact {
+                    artifact_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    job_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    path: PathBuf::from(row.get::<_, String>(4)?),
+                    summary: row.get(5)?,
+                    created_at: from_epoch(row.get(6)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(artifacts)
     }
 
@@ -263,9 +269,12 @@ impl SqlitePersistence {
 
     /// Delete a run and all its jobs and artifacts from SQLite.
     pub fn delete_run(&self, run_id: &str) -> Result<(), rusqlite::Error> {
-        self.conn.execute("DELETE FROM artifacts WHERE run_id = ?1", params![run_id])?;
-        self.conn.execute("DELETE FROM jobs WHERE run_id = ?1", params![run_id])?;
-        self.conn.execute("DELETE FROM runs WHERE run_id = ?1", params![run_id])?;
+        self.conn
+            .execute("DELETE FROM artifacts WHERE run_id = ?1", params![run_id])?;
+        self.conn
+            .execute("DELETE FROM jobs WHERE run_id = ?1", params![run_id])?;
+        self.conn
+            .execute("DELETE FROM runs WHERE run_id = ?1", params![run_id])?;
         Ok(())
     }
 }
@@ -456,7 +465,8 @@ mod tests {
             path: PathBuf::from("/tmp/out.json"),
             summary: "output".into(),
             created_at: SystemTime::now(),
-        }).unwrap();
+        })
+        .unwrap();
 
         // Hydrate into a fresh RunStore
         let mut store = RunStore::new();
@@ -521,14 +531,16 @@ mod tests {
 
         // Hydrate and check
         let runs = db.load_runs().unwrap();
-        let incomplete: Vec<_> = runs.iter()
+        let incomplete: Vec<_> = runs
+            .iter()
             .filter(|r| r.status == RunStatus::Running || r.status == RunStatus::Pending)
             .collect();
         assert_eq!(incomplete.len(), 1);
         assert_eq!(incomplete[0].run_id, "run_active");
 
         let jobs = db.load_jobs().unwrap();
-        let running_jobs: Vec<_> = jobs.iter()
+        let running_jobs: Vec<_> = jobs
+            .iter()
             .filter(|j| j.status == JobStatus::Running)
             .collect();
         assert_eq!(running_jobs.len(), 1);
