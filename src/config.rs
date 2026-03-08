@@ -30,6 +30,15 @@ pub struct DaemonConfig {
   pub sessions_dir: Option<String>,
   #[serde(default = "default_max_revisions")]
   pub max_revisions: u32,
+  /// Isolation backend: "none" (default, bare child process) or "capsule" (ZeptoKernel).
+  #[serde(default = "default_isolation")]
+  pub isolation: String,
+  /// Path to the zk-guest binary (required when isolation = "capsule").
+  #[serde(default)]
+  pub worker_binary: Option<String>,
+  /// Auto-delete completed/failed runs older than N days (0 = disabled).
+  #[serde(default)]
+  pub run_ttl_days: u32,
 }
 
 impl Default for DaemonConfig {
@@ -41,6 +50,9 @@ impl Default for DaemonConfig {
       bind: None,
       sessions_dir: None,
       max_revisions: default_max_revisions(),
+      isolation: default_isolation(),
+      worker_binary: None,
+      run_ttl_days: 0,
     }
   }
 }
@@ -126,6 +138,7 @@ fn default_true() -> bool { true }
 fn default_max_restarts() -> u32 { 5 }
 fn default_restart_backoff() -> u64 { 10_000 }
 fn default_max_revisions() -> u32 { 3 }
+fn default_isolation() -> String { "none".into() }
 
 /// Load config from a TOML file.
 pub fn load_config(path: &str) -> Result<Config, ConfigError> {
@@ -152,6 +165,13 @@ pub fn validate_config(config: &Config) -> Vec<String> {
         errors.push(format!("agents[{}] '{}': max_iterations must be > 0", i, agent.name));
       }
     }
+    // Warn if agent references a provider not defined in [providers.*]
+    if !config.providers.contains_key(&agent.provider) && !config.providers.is_empty() {
+      errors.push(format!(
+        "agents[{}] '{}': provider '{}' not defined in [providers.*]",
+        i, agent.name, agent.provider
+      ));
+    }
   }
 
   // Check for duplicate agent names
@@ -160,6 +180,24 @@ pub fn validate_config(config: &Config) -> Vec<String> {
     if !seen.insert(&agent.name) {
       errors.push(format!("duplicate agent name: '{}'", agent.name));
     }
+  }
+
+  // Validate isolation config
+  match config.daemon.isolation.as_str() {
+    "none" | "capsule" => {}
+    other => {
+      errors.push(format!(
+        "daemon.isolation: unknown value '{}' (expected \"none\" or \"capsule\")",
+        other
+      ));
+    }
+  }
+
+  // Capsule mode requires worker_binary
+  if config.daemon.isolation == "capsule" && config.daemon.worker_binary.is_none() {
+    errors.push(
+      "daemon.isolation = \"capsule\" requires daemon.worker_binary to be set".into()
+    );
   }
 
   errors
@@ -349,6 +387,66 @@ mod tests {
     let h1 = config_hash(&config);
     let h2 = config_hash(&config);
     assert_eq!(h1, h2);
+  }
+
+  #[test]
+  fn test_validate_unknown_provider_ref() {
+    let config = Config {
+      daemon: DaemonConfig::default(),
+      agents: vec![AgentConfig {
+        name: "a".into(),
+        provider: "nonexistent".into(),
+        model: None,
+        system_prompt: None,
+        tools: vec![],
+        auto_start: true,
+        max_restarts: 5,
+        restart_backoff_ms: 10_000,
+        max_iterations: None,
+        timeout_ms: None,
+        budget: None,
+        gateway: None,
+        session_persist: true,
+        max_history: None,
+      }],
+      providers: {
+        let mut m = HashMap::new();
+        m.insert("openrouter".into(), ProviderConfig { api_key: None, base_url: None });
+        m
+      },
+    };
+    let errors = validate_config(&config);
+    assert!(errors.iter().any(|e| e.contains("not defined in [providers.*]")));
+  }
+
+  #[test]
+  fn test_validate_invalid_isolation() {
+    let toml = r#"
+      [daemon]
+      isolation = "firecracker"
+
+      [[agents]]
+      name = "a"
+      provider = "p"
+    "#;
+    let config: Config = toml::from_str(toml).unwrap();
+    let errors = validate_config(&config);
+    assert!(errors.iter().any(|e| e.contains("unknown value")));
+  }
+
+  #[test]
+  fn test_validate_capsule_needs_worker_binary() {
+    let toml = r#"
+      [daemon]
+      isolation = "capsule"
+
+      [[agents]]
+      name = "a"
+      provider = "p"
+    "#;
+    let config: Config = toml::from_str(toml).unwrap();
+    let errors = validate_config(&config);
+    assert!(errors.iter().any(|e| e.contains("worker_binary")));
   }
 
   #[test]

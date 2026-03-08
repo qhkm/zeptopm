@@ -42,6 +42,20 @@ pub enum DaemonCommand {
   ListRuns {
     reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
   },
+  /// Get the final artifact content for a completed run.
+  GetRunResult {
+    run_id: String,
+    reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+  },
+  /// Cancel a running run.
+  CancelRun {
+    run_id: String,
+    reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+  },
+  /// Get daemon metrics.
+  GetMetrics {
+    reply: tokio::sync::oneshot::Sender<serde_json::Value>,
+  },
 }
 
 /// Shared daemon state exposed to HTTP handlers.
@@ -198,6 +212,9 @@ pub fn build_router(state: SharedState) -> Router {
     .route("/health", get(get_health))
     .route("/runs", post(post_run_submit).get(get_runs_list))
     .route("/runs/{id}", get(get_run_status))
+    .route("/runs/{id}/result", get(get_run_result))
+    .route("/runs/{id}/cancel", post(post_run_cancel))
+    .route("/metrics", get(get_metrics))
     .with_state(state)
 }
 
@@ -594,6 +611,56 @@ async fn get_runs_list(
     Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e }))),
     Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR,
       Json(ErrorResponse { error: "daemon did not reply".into() }))),
+  }
+}
+
+async fn get_run_result(
+  State(state): State<SharedState>,
+  Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+  let daemon_tx = { state.read().await.daemon_tx.clone() };
+  let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+  daemon_tx
+    .send(DaemonCommand::GetRunResult { run_id: id, reply: reply_tx })
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR,
+      Json(ErrorResponse { error: "daemon channel closed".into() })))?;
+  match reply_rx.await {
+    Ok(Ok(data)) => Ok(Json(data)),
+    Ok(Err(e)) => Err((StatusCode::NOT_FOUND, Json(ErrorResponse { error: e }))),
+    Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR,
+      Json(ErrorResponse { error: "daemon did not reply".into() }))),
+  }
+}
+
+async fn post_run_cancel(
+  State(state): State<SharedState>,
+  Path(id): Path<String>,
+) -> Result<Json<OkResponse>, (StatusCode, Json<ErrorResponse>)> {
+  let daemon_tx = { state.read().await.daemon_tx.clone() };
+  let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+  daemon_tx
+    .send(DaemonCommand::CancelRun { run_id: id, reply: reply_tx })
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR,
+      Json(ErrorResponse { error: "daemon channel closed".into() })))?;
+  match reply_rx.await {
+    Ok(Ok(msg)) => Ok(Json(OkResponse { status: msg })),
+    Ok(Err(e)) => Err((StatusCode::NOT_FOUND, Json(ErrorResponse { error: e }))),
+    Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR,
+      Json(ErrorResponse { error: "daemon did not reply".into() }))),
+  }
+}
+
+async fn get_metrics(
+  State(state): State<SharedState>,
+) -> Json<serde_json::Value> {
+  let daemon_tx = { state.read().await.daemon_tx.clone() };
+  let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+  let _ = daemon_tx.send(DaemonCommand::GetMetrics { reply: reply_tx }).await;
+  match reply_rx.await {
+    Ok(data) => Json(data),
+    Err(_) => Json(serde_json::json!({"error": "daemon did not reply"})),
   }
 }
 

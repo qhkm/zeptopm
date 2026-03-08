@@ -112,6 +112,16 @@ enum RunAction {
   },
   /// List all runs
   List,
+  /// Print final artifact content for a completed run
+  Result {
+    /// Run ID
+    run_id: String,
+  },
+  /// Cancel a running run (cancels all active jobs)
+  Cancel {
+    /// Run ID
+    run_id: String,
+  },
 }
 
 fn init_tracing(level: &str, format: &str) {
@@ -422,10 +432,87 @@ async fn main() {
         RunAction::List => {
           match http_get(&cli.addr, "/runs").await {
             Ok(resp_body) => {
-              println!("{}", resp_body);
+              let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+              if let Some(runs) = resp.get("runs").and_then(|v| v.as_array()) {
+                if runs.is_empty() {
+                  println!("No runs.");
+                  return;
+                }
+                println!("{:<24} {:<12} {}", "RUN ID", "STATUS", "TASK");
+                println!("{}", "-".repeat(70));
+                for run in runs {
+                  let id = run.get("run_id").and_then(|v| v.as_str()).unwrap_or("?");
+                  let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                  let task = run.get("task").and_then(|v| v.as_str()).unwrap_or("");
+                  let short_task: String = task.chars().take(40).collect();
+                  println!("{:<24} {:<12} {}", id, status, short_task);
+                }
+              }
             }
             Err(e) => {
               eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+              eprintln!("Is the daemon running? Start with: zeptopm daemon");
+              std::process::exit(1);
+            }
+          }
+        }
+        RunAction::Result { run_id } => {
+          match http_get(&cli.addr, &format!("/runs/{}/result", run_id)).await {
+            Ok(resp_body) => {
+              let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+              if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+                eprintln!("Error: {}", error);
+                std::process::exit(1);
+              }
+              let status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+              println!("Run: {}  Status: {}", run_id, status);
+              if let Some(artifacts) = resp.get("artifacts").and_then(|v| v.as_array()) {
+                for artifact in artifacts {
+                  let kind = artifact.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                  let summary = artifact.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                  let path = artifact.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                  println!("\n--- artifact ({}) ---", kind);
+                  if !summary.is_empty() {
+                    println!("Summary: {}", summary);
+                  }
+                  if !path.is_empty() {
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                      println!("{}", content);
+                    } else {
+                      println!("(file: {})", path);
+                    }
+                  }
+                }
+              }
+            }
+            Err(e) => {
+              eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+              eprintln!("Is the daemon running? Start with: zeptopm daemon");
+              std::process::exit(1);
+            }
+          }
+        }
+        RunAction::Cancel { run_id } => {
+          match http_post(
+            &cli.addr,
+            &format!("/runs/{}/cancel", run_id),
+            &serde_json::json!({}),
+          )
+          .await
+          {
+            Ok(resp_body) => {
+              let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
+              if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+                eprintln!("Error: {}", error);
+                std::process::exit(1);
+              }
+              if let Some(status) = resp.get("status").and_then(|v| v.as_str()) {
+                println!("{}", status);
+              }
+            }
+            Err(e) => {
+              eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+              eprintln!("Is the daemon running? Start with: zeptopm daemon");
               std::process::exit(1);
             }
           }

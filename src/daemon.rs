@@ -38,6 +38,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
     "zeptopm daemon starting"
   );
 
+  let daemon_start = Instant::now();
   let (state_tx, mut state_rx) = mpsc::channel::<AgentStateUpdate>(256);
 
   // Daemon command channel (HTTP handlers -> daemon loop)
@@ -169,6 +170,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
   let mut current_config = config.clone();
   let mut last_config_hash = config::config_hash(&config);
   let poll_interval = Duration::from_millis(config.daemon.poll_interval_ms);
+  let mut last_cleanup = Instant::now();
 
   // Main loop
   let mut poll_timer = tokio::time::interval(poll_interval);
@@ -330,6 +332,24 @@ pub async fn run(config_path: String, bind: Option<String>) {
             let runs = get_runs_list_data(&orchestrator);
             let _ = reply.send(Ok(runs));
           }
+          DaemonCommand::GetRunResult { run_id, reply } => {
+            let result = get_run_result_data(&orchestrator, &run_id);
+            let _ = reply.send(result);
+          }
+          DaemonCommand::CancelRun { run_id, reply } => {
+            let result = cancel_run(&mut orchestrator, &run_id, &mut managed);
+            // Persist cancellation to SQLite
+            if result.is_ok() {
+              if let Some(ref db) = db {
+                db.persist_run_state(&orchestrator.store, &run_id).ok();
+              }
+            }
+            let _ = reply.send(result);
+          }
+          DaemonCommand::GetMetrics { reply } => {
+            let metrics = get_metrics_data(&orchestrator, &managed, &daemon_start);
+            let _ = reply.send(metrics);
+          }
         }
       }
 
@@ -370,25 +390,39 @@ pub async fn run(config_path: String, bind: Option<String>) {
               // Read planner output and try to parse as ExecutionPlan
               if let Some(artifact) = artifacts.first().and_then(|aid| orchestrator.store.get_artifact(aid)) {
                 let plan_text = std::fs::read_to_string(&artifact.path).unwrap_or_default();
-                // Try to extract JSON from the response (may be wrapped in markdown)
                 let json_str = extract_json(&plan_text);
                 match serde_json::from_str::<crate::orchestrator::types::ExecutionPlan>(&json_str) {
                   Ok(plan) => {
-                    info!(run_id = %run_id, jobs = plan.jobs.len(), "planner produced execution plan");
-                    let new_job_ids = crate::orchestrator::planner::materialize_plan(
-                      &mut orchestrator.store, &run_id, &job_id, &plan
-                    );
-                    // Promote ready jobs to the queue
-                    for jid in &new_job_ids {
-                      if let Some(j) = orchestrator.store.get_job(jid) {
-                        if j.status == crate::orchestrator::types::JobStatus::Ready {
-                          orchestrator.ready_queue.push_back(jid.clone());
+                    // Validate the plan before materializing
+                    let validation_errors = crate::orchestrator::planner::validate_plan(&plan);
+                    if validation_errors.is_empty() {
+                      info!(run_id = %run_id, jobs = plan.jobs.len(), "planner produced execution plan");
+                      let new_job_ids = crate::orchestrator::planner::materialize_plan(
+                        &mut orchestrator.store, &run_id, &job_id, &plan
+                      );
+                      for jid in &new_job_ids {
+                        if let Some(j) = orchestrator.store.get_job(jid) {
+                          if j.status == crate::orchestrator::types::JobStatus::Ready {
+                            orchestrator.ready_queue.push_back(jid.clone());
+                          }
                         }
                       }
+                    } else {
+                      warn!(
+                        run_id = %run_id,
+                        errors = ?validation_errors,
+                        "planner output failed validation — marking run failed"
+                      );
+                      orchestrator.mark_failed(&job_id, format!("invalid plan: {}", validation_errors.join("; ")));
                     }
                   }
                   Err(e) => {
-                    warn!(run_id = %run_id, error = %e, "failed to parse planner output as ExecutionPlan");
+                    warn!(
+                      run_id = %run_id,
+                      error = %e,
+                      "failed to parse planner output as JSON — marking run failed"
+                    );
+                    orchestrator.mark_failed(&job_id, format!("malformed plan output: {}", e));
                   }
                 }
               }
@@ -523,6 +557,36 @@ pub async fn run(config_path: String, bind: Option<String>) {
           }
         }
 
+        // TTL-based run cleanup (check once per hour)
+        if current_config.daemon.run_ttl_days > 0
+          && last_cleanup.elapsed() > Duration::from_secs(3600)
+        {
+          last_cleanup = Instant::now();
+          let ttl = Duration::from_secs(current_config.daemon.run_ttl_days as u64 * 86400);
+          let cutoff = std::time::SystemTime::now() - ttl;
+          let expired: Vec<String> = orchestrator.store.list_runs().iter()
+            .filter(|r| {
+              (r.status == crate::orchestrator::types::RunStatus::Completed
+                || r.status == crate::orchestrator::types::RunStatus::Failed
+                || r.status == crate::orchestrator::types::RunStatus::Cancelled)
+                && r.updated_at < cutoff
+            })
+            .map(|r| r.run_id.clone())
+            .collect();
+          if !expired.is_empty() {
+            for run_id in &expired {
+              let paths = orchestrator.store.remove_run(run_id);
+              for path in &paths {
+                std::fs::remove_file(path).ok();
+              }
+              if let Some(ref db) = db {
+                db.delete_run(run_id).ok();
+              }
+            }
+            info!(cleaned = expired.len(), "TTL cleanup: removed expired runs");
+          }
+        }
+
         // Check for agents that need restarting
         let now = Instant::now();
         let restart_names: Vec<String> = managed
@@ -558,13 +622,35 @@ pub async fn run(config_path: String, bind: Option<String>) {
 
   // Graceful shutdown
   info!("shutting down...");
+
+  // Cancel all running orchestration jobs
+  let running_run_ids: Vec<String> = orchestrator.store.list_runs().iter()
+    .filter(|r| r.status == crate::orchestrator::types::RunStatus::Running
+      || r.status == crate::orchestrator::types::RunStatus::Pending)
+    .map(|r| r.run_id.clone())
+    .collect();
+  for run_id in &running_run_ids {
+    let _ = cancel_run(&mut orchestrator, run_id, &mut managed);
+    if let Some(ref db) = db {
+      db.persist_run_state(&orchestrator.store, run_id).ok();
+    }
+  }
+  if !running_run_ids.is_empty() {
+    info!(runs = running_run_ids.len(), "cancelled in-flight runs");
+  }
+
+  // Stop all agents
   for (name, internal) in &managed {
     internal.handle.stop().await;
     info!(agent = %name, "sent stop to agent");
   }
 
+  // Brief wait for processes to exit
   tokio::time::sleep(Duration::from_secs(2)).await;
-  info!("zeptopm stopped");
+  info!(
+    uptime_secs = daemon_start.elapsed().as_secs(),
+    "zeptopm stopped"
+  );
 }
 
 struct InternalAgent {
@@ -680,7 +766,7 @@ async fn apply_config_changes(
 }
 
 /// Spawn a temporary worker process for an orchestration job.
-/// Sends a `job_execute` command via the worker's stdin.
+/// When isolation = "capsule", uses ZeptoKernel capsule. Otherwise spawns bare child process.
 async fn spawn_job_worker(
   job: &crate::orchestrator::types::Job,
   config_path: &str,
@@ -691,6 +777,13 @@ async fn spawn_job_worker(
   _shared_state: &SharedState,
   orchestrator_store: &crate::orchestrator::store::RunStore,
 ) {
+  // Capsule mode — delegate to ZeptoKernel
+  if config.daemon.isolation == "capsule" {
+    let guest_binary = config.daemon.worker_binary.as_deref().unwrap_or("zk-guest");
+    crate::capsule::spawn_capsule_job(job, guest_binary, orch_event_tx, orchestrator_store).await;
+    return;
+  }
+
   // Find an agent config matching the job's role/profile_id
   let agent_config = match config.agents.iter().find(|a| a.name == job.profile_id) {
     Some(c) => c,
@@ -807,6 +900,137 @@ fn extract_json(text: &str) -> String {
     }
   }
   trimmed.to_string()
+}
+
+/// Get the final artifact content for a completed run.
+fn get_run_result_data(
+  orchestrator: &OrchestratorEngine,
+  run_id: &str,
+) -> Result<serde_json::Value, String> {
+  let run = orchestrator.store.get_run(run_id)
+    .ok_or_else(|| format!("run '{}' not found", run_id))?;
+
+  // Collect final artifacts (from completed jobs with no dependents)
+  let jobs = orchestrator.store.list_run_jobs(run_id);
+  let mut artifacts = Vec::new();
+
+  for job in &jobs {
+    if job.status == crate::orchestrator::types::JobStatus::Completed {
+      for aid in &job.output_artifact_ids {
+        if let Some(artifact) = orchestrator.store.get_artifact(aid) {
+          let content = std::fs::read_to_string(&artifact.path).ok();
+          artifacts.push(serde_json::json!({
+            "artifact_id": artifact.artifact_id,
+            "job_id": artifact.job_id,
+            "kind": artifact.kind,
+            "path": artifact.path.to_string_lossy(),
+            "summary": artifact.summary,
+            "content": content,
+          }));
+        }
+      }
+    }
+  }
+
+  Ok(serde_json::json!({
+    "run_id": run.run_id,
+    "task": run.task,
+    "status": format!("{:?}", run.status),
+    "artifacts": artifacts,
+  }))
+}
+
+/// Cancel a running run — kill active workers, mark jobs failed.
+fn cancel_run(
+  orchestrator: &mut OrchestratorEngine,
+  run_id: &str,
+  managed: &mut HashMap<String, InternalAgent>,
+) -> Result<String, String> {
+  let run = orchestrator.store.get_run(run_id)
+    .ok_or_else(|| format!("run '{}' not found", run_id))?;
+
+  if run.status != crate::orchestrator::types::RunStatus::Running
+    && run.status != crate::orchestrator::types::RunStatus::Pending
+  {
+    return Err(format!("run '{}' is already {:?}", run_id, run.status));
+  }
+
+  // Collect job IDs and their statuses first to avoid borrow conflicts
+  let jobs_to_cancel: Vec<(String, crate::orchestrator::types::JobStatus)> = orchestrator
+    .store
+    .list_run_jobs(run_id)
+    .iter()
+    .map(|j| (j.job_id.clone(), j.status.clone()))
+    .collect();
+
+  let mut cancelled = 0u32;
+
+  for (job_id, status) in &jobs_to_cancel {
+    match status {
+      crate::orchestrator::types::JobStatus::Running => {
+        // Kill the worker process
+        let worker_name = format!("__job_{}", job_id);
+        if let Some(internal) = managed.get(&worker_name) {
+          let handle = internal.handle.clone();
+          tokio::spawn(async move { handle.stop().await; });
+        }
+        orchestrator.mark_failed(job_id, "cancelled by user".into());
+        cancelled += 1;
+      }
+      crate::orchestrator::types::JobStatus::Ready
+      | crate::orchestrator::types::JobStatus::Pending => {
+        orchestrator.mark_failed(job_id, "cancelled by user".into());
+        cancelled += 1;
+      }
+      _ => {}
+    }
+  }
+
+  // Drain the ready queue for this run
+  let run_id_owned = run_id.to_string();
+  orchestrator.ready_queue.retain(|jid| {
+    orchestrator.store.get_job(jid)
+      .map(|j| j.run_id != run_id_owned)
+      .unwrap_or(true)
+  });
+
+  // Mark run as cancelled
+  if let Some(run) = orchestrator.store.get_run_mut(run_id) {
+    run.status = crate::orchestrator::types::RunStatus::Cancelled;
+    run.updated_at = std::time::SystemTime::now();
+  }
+
+  info!(run_id = %run_id, cancelled_jobs = cancelled, "run cancelled");
+  Ok(format!("run '{}' cancelled ({} jobs cancelled)", run_id, cancelled))
+}
+
+/// Get daemon metrics.
+fn get_metrics_data(
+  orchestrator: &OrchestratorEngine,
+  managed: &HashMap<String, InternalAgent>,
+  daemon_start: &Instant,
+) -> serde_json::Value {
+  let agent_count = managed.keys().filter(|k| !k.starts_with("__job_")).count();
+  let worker_count = managed.keys().filter(|k| k.starts_with("__job_")).count();
+  let runs = orchestrator.store.list_runs();
+  let total_runs = runs.len();
+  let running_runs = runs.iter().filter(|r| r.status == crate::orchestrator::types::RunStatus::Running).count();
+  let completed_runs = runs.iter().filter(|r| r.status == crate::orchestrator::types::RunStatus::Completed).count();
+  let failed_runs = runs.iter().filter(|r| r.status == crate::orchestrator::types::RunStatus::Failed).count();
+  let pending_jobs = orchestrator.ready_queue.len();
+
+  serde_json::json!({
+    "uptime_secs": daemon_start.elapsed().as_secs(),
+    "agents": agent_count,
+    "active_workers": worker_count,
+    "runs": {
+      "total": total_runs,
+      "running": running_runs,
+      "completed": completed_runs,
+      "failed": failed_runs,
+    },
+    "pending_jobs": pending_jobs,
+  })
 }
 
 fn get_runs_list_data(orchestrator: &OrchestratorEngine) -> serde_json::Value {

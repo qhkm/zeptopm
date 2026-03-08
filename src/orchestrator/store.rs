@@ -28,6 +28,10 @@ impl RunStore {
         self.runs.get(run_id)
     }
 
+    pub fn get_run_mut(&mut self, run_id: &str) -> Option<&mut Run> {
+        self.runs.get_mut(run_id)
+    }
+
     pub fn list_runs(&self) -> Vec<&Run> {
         self.runs.values().collect()
     }
@@ -58,6 +62,29 @@ impl RunStore {
 
     pub fn get_artifact(&self, artifact_id: &str) -> Option<&Artifact> {
         self.artifacts.get(artifact_id)
+    }
+
+    /// Remove a run and all its jobs and artifacts. Returns artifact paths for cleanup.
+    pub fn remove_run(&mut self, run_id: &str) -> Vec<std::path::PathBuf> {
+        self.runs.remove(run_id);
+        let job_ids: Vec<String> = self.jobs.values()
+            .filter(|j| j.run_id == run_id)
+            .map(|j| j.job_id.clone())
+            .collect();
+        for jid in &job_ids {
+            self.jobs.remove(jid);
+        }
+        let artifact_ids: Vec<String> = self.artifacts.values()
+            .filter(|a| a.run_id == run_id)
+            .map(|a| a.artifact_id.clone())
+            .collect();
+        let mut paths = Vec::new();
+        for aid in &artifact_ids {
+            if let Some(artifact) = self.artifacts.remove(aid) {
+                paths.push(artifact.path);
+            }
+        }
+        paths
     }
 }
 

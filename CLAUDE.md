@@ -9,13 +9,14 @@ zeptoPM is a process manager for AI agents — like PM2 for Node.js, but for LLM
 Standalone Rust binary (~11 MB). No external dependencies on zeptoRT or erlangrt. ~4 MB RSS per worker process.
 
 ### Core modules
-- `config.rs` — TOML config parsing, $ENV_VAR expansion, validation (5 tests)
+- `config.rs` — TOML config parsing, $ENV_VAR expansion, validation (8 tests)
 - `llm.rs` — HTTP client for OpenAI-compatible APIs (reqwest)
 - `provider.rs` — LLM provider factory
 - `agent.rs` — Process spawn, worker bridge, JSON-line IPC (3 tests)
 - `worker.rs` — Worker process, session persistence, ZeptoAgent integration, job_execute handler
 - `daemon.rs` — Supervisor loop, config reload, orchestrator integration
-- `server.rs` — Axum HTTP API, run endpoints, gateway auth, rate limiting
+- `capsule.rs` — ZeptoKernel integration: Job→JobSpec mapping, capsule job runner (4 tests)
+- `server.rs` — Axum HTTP API, run endpoints, gateway auth, rate limiting, metrics
 - `status.rs` — Status display formatting (2 tests)
 - `main.rs` — CLI entry point (clap)
 
@@ -26,13 +27,13 @@ Standalone Rust binary (~11 MB). No external dependencies on zeptoRT or erlangrt
 - `engine.rs` — OrchestratorEngine: submit_run, next_job, heartbeat, review loop (15 tests)
 - `review.rs` — Review decision parsing: JSON + keyword fallback (8 tests)
 - `sqlite_store.rs` — SQLite persistence sidecar: persist/load/hydrate (8 tests)
-- `planner.rs` — ExecutionPlan → child jobs materializer (2 tests)
+- `planner.rs` — Plan validation + ExecutionPlan → child jobs materializer (7 tests)
 
 ## Build & Run
 
 ```bash
 cargo build                           # build
-cargo test                            # run all 58 tests
+cargo test                            # run all 74 tests
 cargo run -- daemon                   # start with default config
 cargo run -- daemon -c config.toml    # custom config
 cargo run -- status                   # show agents
@@ -40,12 +41,14 @@ cargo run -- chat <name> "message"    # chat with agent
 cargo run -- run submit "task"        # submit orchestrated run
 cargo run -- run status <run_id>      # check run progress
 cargo run -- run list                 # list all runs
+cargo run -- run result <run_id>      # print artifact content
+cargo run -- run cancel <run_id>      # cancel a running run
 ```
 
 ## Config Format
 
 See `zeptopm.toml` for the full example. Key sections:
-- `[daemon]` — poll interval, log level, max_concurrent_jobs
+- `[daemon]` — poll interval, log level, max_concurrent_jobs, isolation mode, worker_binary, run_ttl_days
 - `[[agents]]` — agent definitions (name, provider, model, system_prompt, tools, budget)
 - `[providers.*]` — API keys and base URLs (supports `$ENV_VAR` expansion)
 
@@ -58,7 +61,7 @@ See `zeptopm.toml` for the full example. Key sections:
 
 ## Relationship to Other Projects
 
-- **ZeptoKernel** (~/ios/zeptokernel) — Secure per-worker execution capsule. Future: zeptoPM spawns jobs inside ZeptoKernel capsules for isolation.
+- **ZeptoKernel** (~/ios/zeptokernel) — Secure per-worker execution capsule. Integrated: `isolation = "capsule"` in config routes jobs through ZeptoKernel's ProcessBackend + Supervisor.
 - **ZeptoClaw** — AI worker binary. The actual task executor inside capsules.
 - **zeptoRT** (~/ios/zeptoclaw-rt) — Enterprise durable runtime (Erlang-inspired). Separate from zeptoPM.
 

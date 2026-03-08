@@ -260,6 +260,14 @@ impl SqlitePersistence {
         }
         Ok(())
     }
+
+    /// Delete a run and all its jobs and artifacts from SQLite.
+    pub fn delete_run(&self, run_id: &str) -> Result<(), rusqlite::Error> {
+        self.conn.execute("DELETE FROM artifacts WHERE run_id = ?1", params![run_id])?;
+        self.conn.execute("DELETE FROM jobs WHERE run_id = ?1", params![run_id])?;
+        self.conn.execute("DELETE FROM runs WHERE run_id = ?1", params![run_id])?;
+        Ok(())
+    }
 }
 
 // --- Serialization helpers ---

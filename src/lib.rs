@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod capsule;
 pub mod config;
 pub mod daemon;
 pub mod provider;

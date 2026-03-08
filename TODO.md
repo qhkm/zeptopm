@@ -1,6 +1,6 @@
 # ZeptoPM — TODO & Roadmap
 
-> **For agents:** Read this file first when picking up work. Run `cargo test` after every change — all 35 tests must pass before committing.
+> **For agents:** Read this file first when picking up work. Run `cargo test` after every change — all 74 tests must pass before committing.
 
 ## Quick Context
 
@@ -10,7 +10,7 @@
 
 **Stack position:** ZeptoPM (this) → ZeptoKernel (isolation) → ZeptoClaw (worker)
 
-**Current state:** Core PM shipped. Orchestration Phases 1–6 done. 58 tests passing. Zero warnings.
+**Current state:** Core PM shipped. Orchestration Phases 1–7 done. All infrastructure tasks done. 74 tests passing. Zero warnings.
 
 **Design docs:**
 - `docs/plans/2026-03-08-orchestration-design.md` — architecture decisions
@@ -35,7 +35,9 @@
 | Orch Phase 4: Heartbeat | ✅ Done | Progress tracking, stuck job detection (4 tests) |
 | Orch Phase 5: Review loop | ✅ Done | Review parsing, revision re-queueing (11 tests) |
 | SQLite persistence | ✅ Done | WAL-mode SQLite, hydration on restart (8 tests) |
-| ZeptoKernel integration | 🔴 Not started | Isolated capsule execution |
+| ZeptoKernel integration | ✅ Done | Library integration, capsule job runner (4 tests) |
+| Planner validation | ✅ Done | Plan structure validation, retry on malformed (5 tests) |
+| Integration tests | ✅ Done | Full orchestrator flow tests without daemon/LLM (4 tests) |
 | End-to-end testing | 🔴 Not started | Real daemon + LLM smoke test |
 
 ---
@@ -46,6 +48,7 @@
 |------|-------|-------------|
 | `src/main.rs` | ~500 | CLI (clap): daemon, status, chat, logs, start/stop, pipeline, orchestrate, run |
 | `src/lib.rs` | ~10 | Module exports |
+| `src/capsule.rs` | ~160 | ZeptoKernel integration: Job→JobSpec mapping, capsule job runner (4 tests) |
 | `src/config.rs` | ~200 | TOML parsing, $ENV_VAR expansion, validation (5 tests) |
 | `src/daemon.rs` | ~400 | Supervisor loop, agent lifecycle, config reload, orchestrator wiring |
 | `src/agent.rs` | ~300 | Process spawn, worker bridge, JSON-line IPC, orch event forwarding (3 tests) |
@@ -61,7 +64,8 @@
 | `src/orchestrator/engine.rs` | ~470 | OrchestratorEngine: submit_run, next_job, heartbeat, review loop (15 tests) |
 | `src/orchestrator/review.rs` | ~140 | Review decision parsing: JSON + keyword fallback (8 tests) |
 | `src/orchestrator/sqlite_store.rs` | ~350 | SQLite persistence sidecar: persist/load/hydrate (8 tests) |
-| `src/orchestrator/planner.rs` | ~80 | ExecutionPlan → child jobs materializer (2 tests) |
+| `src/orchestrator/planner.rs` | ~270 | Plan validation + ExecutionPlan → child jobs materializer (7 tests) |
+| `tests/orchestrator_integration.rs` | ~270 | Integration tests: full lifecycle, parallel, validation (4 tests) |
 
 ---
 
@@ -154,32 +158,37 @@ Run orchestration jobs inside ZeptoKernel capsules instead of bare child process
 
 ### Tasks
 
-- [ ] **7.1 — Decision: library vs binary**
-  - Option A: Add `zk-host` as a Cargo dependency, call Backend::spawn() directly
-  - Option B: Spawn `zk-host` binary and communicate via its JSON-line protocol
-  - **Decision needed before implementation**
+- [x] **7.1 — Decision: library integration (Option A)**
+  - Added `zk-host` and `zk-proto` as Cargo path dependencies
+  - Library integration chosen over binary — simpler, type-safe, no IPC overhead
 
-- [ ] **7.2 — JobSpec mapping**
-  - Map ZeptoPM `Job` → ZeptoKernel `JobSpec`
-  - Fields: job_id, run_id, role, instruction, env, limits
-  - Handle input artifacts: resolve ZeptoPM artifact paths to capsule workspace paths
+- [x] **7.2 — JobSpec mapping** (`src/capsule.rs`)
+  - `job_to_spec()` maps ZeptoPM `Job` → ZeptoKernel `JobSpec`
+  - Fields: job_id, run_id, role, instruction, env, limits, workspace
+  - Input artifacts mapped with paths and artifact IDs
+  - Environment passthrough for API keys (OPENROUTER_, OPENAI_, ANTHROPIC_)
+  - 4 tests: basic mapping, no artifacts, env passthrough, default limits
 
-- [ ] **7.3 — Event translation**
-  - Map ZeptoKernel `GuestEvent` → ZeptoPM orchestrator events
-  - Started → mark_running, Heartbeat → update last_seen, Completed → mark_completed, Failed → mark_failed
+- [x] **7.3 — Event translation** (`src/capsule.rs`)
+  - `spawn_capsule_job()` wraps `Supervisor::run_job()` in tokio::spawn
+  - `JobOutcome::Completed` → `job_completed` event on orch channel
+  - `JobOutcome::Failed` → `job_failed` event on orch channel
+  - `JobOutcome::Cancelled` → `job_failed` (cancelled) event
+  - Supervisor errors → `job_failed` (retryable) event
+  - Periodic heartbeats (10s) sent while capsule runs to prevent stale detection
 
-- [ ] **7.4 — Backend selection config**
-  - Add to `[daemon]` config: `isolation = "none" | "process" | "namespace" | "firecracker"`
-  - Default: `"process"` (current behavior, no isolation)
-  - When `"namespace"` or `"firecracker"`: use ZeptoKernel
+- [x] **7.4 — Backend selection config** (`src/config.rs`)
+  - `isolation = "none" | "capsule"` in `[daemon]` config (default: `"none"`)
+  - `worker_binary = "/path/to/zk-guest"` (required when isolation = "capsule")
+  - `spawn_job_worker()` branches on isolation config
 
-- [ ] **7.5 — Integration test**
-  - Submit run with ZeptoKernel process backend
-  - Verify events flow correctly through capsule boundary
+- [ ] **7.5 — End-to-end integration test**
+  - Requires `zk-guest` binary built and available
+  - Deferred until zk-guest has full agent capabilities
 
-**Exit criteria:** `zeptopm run submit` with `isolation = "process"` uses ZeptoKernel capsule.
+**Exit criteria:** `zeptopm run submit` with `isolation = "capsule"` + `worker_binary` spawns capsule.
 
-**Dependency:** ZeptoKernel M2.5 (real worker launching) must be done first. See `/Users/dr.noranizaahmad/ios/zeptokernel/TODO.md`.
+**Dependency:** ZeptoKernel M2.5 ✅ complete. zk-guest worker capabilities needed for E2E test.
 
 ---
 
@@ -187,15 +196,15 @@ Run orchestration jobs inside ZeptoKernel capsules instead of bare child process
 
 Independent tasks, can be done anytime.
 
-- [ ] **CLAUDE.md update** — Add orchestrator module docs, file map, test commands
-- [ ] **CI setup** — GitHub Actions: build + test + clippy + fmt
-- [ ] **Config validation** — Warn on unknown keys, validate provider/model combos
-- [ ] **Graceful shutdown** — SIGTERM handler: cancel running jobs, wait for cleanup, then exit
-- [ ] **Run cleanup** — TTL-based artifact cleanup (delete runs older than N days)
-- [ ] **`run result` command** — Print final artifact content for a completed run
-- [ ] **`run cancel` command** — Cancel a running run (cancel all active jobs)
-- [ ] **Error messages** — Better error context when daemon is not running, config is invalid, etc.
-- [ ] **Metrics endpoint** — `GET /metrics` with agent count, uptime, run stats
+- [x] **CLAUDE.md update** — Orchestrator module docs, file map, test commands updated
+- [x] **CI setup** — `.github/workflows/ci.yml`: build + test + clippy + fmt on push/PR
+- [x] **Config validation** — Provider ref check, isolation value validation, capsule requires worker_binary (3 tests)
+- [x] **Graceful shutdown** — SIGTERM/SIGINT: cancel running runs, persist to SQLite, stop agents, log uptime
+- [x] **Run cleanup** — `daemon.run_ttl_days` config: auto-deletes expired runs + artifacts hourly
+- [x] **`run result` command** — `zeptopm run result <run_id>`: prints artifact content for completed runs
+- [x] **`run cancel` command** — `zeptopm run cancel <run_id>`: kills workers, marks jobs failed, updates run status
+- [x] **Error messages** — CLI commands show "Is the daemon running?" hint on connection failure, `run list` formatted table
+- [x] **Metrics endpoint** — `GET /metrics`: uptime, agent count, worker count, run stats, pending jobs
 
 ---
 
@@ -203,8 +212,8 @@ Independent tasks, can be done anytime.
 
 1. ~~**In-memory store**~~ — Fixed by Phase 6 SQLite persistence.
 2. **No end-to-end test** — Orchestration hasn't been tested with real LLM calls yet. Need test config + API key.
-3. **`test-persist.toml`** — Untracked test artifact in repo root. Should be gitignored or committed.
-4. **Planner fragility** — Planner output must be valid JSON matching ExecutionPlan schema. No validation/retry on malformed plans yet.
+3. ~~**`test-persist.toml`**~~ — Fixed: added to `.gitignore`.
+4. ~~**Planner fragility**~~ — Fixed: `validate_plan()` checks structure before materializing; invalid plans trigger retry via `mark_failed()`.
 
 ---
 
@@ -212,7 +221,7 @@ Independent tasks, can be done anytime.
 
 1. **Read this file** — you're doing it
 2. **Read `CLAUDE.md`** — project conventions
-3. **Run `cargo test`** — verify 58 tests pass
+3. **Run `cargo test`** — verify 74 tests pass
 4. **Pick the next unchecked task** — Phase 7 or Infrastructure tasks
 5. **Implement, test, commit** — one task at a time
 6. **Update this file** — check off completed tasks

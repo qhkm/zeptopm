@@ -3875,6 +3875,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zeptoclaw",
+ "zk-host",
+ "zk-proto",
 ]
 
 [[package]]
@@ -3969,6 +3971,29 @@ dependencies = [
  "memchr",
  "typed-path",
  "zopfli",
+]
+
+[[package]]
+name = "zk-host"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zk-proto",
+]
+
+[[package]]
+name = "zk-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

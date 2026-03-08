@@ -5,6 +5,55 @@ use crate::orchestrator::scheduler::gen_id;
 use crate::orchestrator::store::RunStore;
 use crate::orchestrator::types::*;
 
+/// Validate an ExecutionPlan. Returns a list of errors (empty = valid).
+pub fn validate_plan(plan: &ExecutionPlan) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    if plan.jobs.is_empty() {
+        errors.push("plan has no jobs".into());
+        return errors;
+    }
+
+    let local_ids: std::collections::HashSet<&str> =
+        plan.jobs.iter().map(|j| j.local_id.as_str()).collect();
+
+    for (i, job) in plan.jobs.iter().enumerate() {
+        if job.local_id.trim().is_empty() {
+            errors.push(format!("job[{}]: local_id is empty", i));
+        }
+        if job.role.trim().is_empty() {
+            errors.push(format!("job[{}] '{}': role is empty", i, job.local_id));
+        }
+        if job.profile_id.trim().is_empty() {
+            errors.push(format!("job[{}] '{}': profile_id is empty", i, job.local_id));
+        }
+        if job.instruction.trim().is_empty() {
+            errors.push(format!("job[{}] '{}': instruction is empty", i, job.local_id));
+        }
+        for dep in &job.depends_on {
+            if !local_ids.contains(dep.as_str()) {
+                errors.push(format!(
+                    "job[{}] '{}': depends_on '{}' not found in plan",
+                    i, job.local_id, dep
+                ));
+            }
+            if dep == &job.local_id {
+                errors.push(format!("job[{}] '{}': depends on itself", i, job.local_id));
+            }
+        }
+    }
+
+    // Check for duplicate local_ids
+    let mut seen = std::collections::HashSet::new();
+    for job in &plan.jobs {
+        if !seen.insert(&job.local_id) {
+            errors.push(format!("duplicate local_id: '{}'", job.local_id));
+        }
+    }
+
+    errors
+}
+
 /// Turn an ExecutionPlan into real Jobs in the store.
 /// Returns the list of created job IDs in plan order.
 pub fn materialize_plan(
@@ -152,5 +201,71 @@ mod tests {
         let merge = store.get_job(&job_ids[2]).unwrap();
         assert_eq!(merge.status, JobStatus::Pending);
         assert_eq!(merge.depends_on.len(), 2);
+    }
+
+    #[test]
+    fn test_validate_valid_plan() {
+        let plan = ExecutionPlan {
+            jobs: vec![PlannedJob {
+                local_id: "a".into(),
+                role: "coder".into(),
+                profile_id: "coder".into(),
+                instruction: "Write code".into(),
+                depends_on: vec![],
+            }],
+        };
+        assert!(validate_plan(&plan).is_empty());
+    }
+
+    #[test]
+    fn test_validate_empty_plan() {
+        let plan = ExecutionPlan { jobs: vec![] };
+        let errors = validate_plan(&plan);
+        assert!(errors.iter().any(|e| e.contains("no jobs")));
+    }
+
+    #[test]
+    fn test_validate_missing_dep() {
+        let plan = ExecutionPlan {
+            jobs: vec![PlannedJob {
+                local_id: "a".into(),
+                role: "coder".into(),
+                profile_id: "coder".into(),
+                instruction: "Write code".into(),
+                depends_on: vec!["nonexistent".into()],
+            }],
+        };
+        let errors = validate_plan(&plan);
+        assert!(errors.iter().any(|e| e.contains("not found in plan")));
+    }
+
+    #[test]
+    fn test_validate_self_dep() {
+        let plan = ExecutionPlan {
+            jobs: vec![PlannedJob {
+                local_id: "a".into(),
+                role: "coder".into(),
+                profile_id: "coder".into(),
+                instruction: "Write code".into(),
+                depends_on: vec!["a".into()],
+            }],
+        };
+        let errors = validate_plan(&plan);
+        assert!(errors.iter().any(|e| e.contains("depends on itself")));
+    }
+
+    #[test]
+    fn test_validate_empty_fields() {
+        let plan = ExecutionPlan {
+            jobs: vec![PlannedJob {
+                local_id: "a".into(),
+                role: "".into(),
+                profile_id: "".into(),
+                instruction: "".into(),
+                depends_on: vec![],
+            }],
+        };
+        let errors = validate_plan(&plan);
+        assert!(errors.len() >= 3); // role, profile_id, instruction
     }
 }
