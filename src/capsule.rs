@@ -55,13 +55,23 @@ impl CapsuleBackend {
 /// since `NamespaceBackend` is Linux-only.
 pub fn make_backend(config: &crate::config::Config) -> CapsuleBackend {
     let guest = config.daemon.worker_binary.as_deref().unwrap_or("zk-guest");
+    let zeptoclaw = config.daemon.zeptoclaw_binary.as_deref();
     match config.daemon.isolation.as_str() {
         #[cfg(all(target_os = "linux", feature = "namespace"))]
         "namespace" => CapsuleBackend::Namespace(NamespaceBackend::new(guest)),
         // "capsule" is a backward-compat alias for "process"; "none" and unknown values
         // also produce ProcessBackend (safe default).
-        "process" | "capsule" | "none" => CapsuleBackend::Process(ProcessBackend::new(guest)),
-        _ => CapsuleBackend::Process(ProcessBackend::new(guest)),
+        _ => {
+            let mut backend = ProcessBackend::new(guest);
+            // Inject ZEPTOCLAW_BINARY into the guest's process environment so it can
+            // locate the worker binary. This is a fallback for the spec.env path which
+            // is sent via the protocol — the process env is more reliable since it
+            // doesn't depend on protocol deserialization.
+            if let Some(zc) = zeptoclaw {
+                backend = backend.with_env("ZEPTOCLAW_BINARY", zc);
+            }
+            CapsuleBackend::Process(backend)
+        }
     }
 }
 
