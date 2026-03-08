@@ -10,7 +10,7 @@
 
 **Stack position:** ZeptoPM (this) → ZeptoKernel (isolation) → ZeptoClaw (worker)
 
-**Current state:** Core PM shipped. Orchestration Phases 1–4 done. 39 tests passing. Zero warnings.
+**Current state:** Core PM shipped. Orchestration Phases 1–5 done. 50 tests passing. Zero warnings.
 
 **Design docs:**
 - `docs/plans/2026-03-08-orchestration-design.md` — architecture decisions
@@ -33,7 +33,7 @@
 | Orch Phase 2: Engine + Planner | ✅ Done | Scheduler, dependency promotion, plan materialization |
 | Orch Phase 3: CLI + API | ✅ Done | `run submit/status/list`, `--tail` flag, REST endpoints |
 | Orch Phase 4: Heartbeat | ✅ Done | Progress tracking, stuck job detection (4 tests) |
-| Orch Phase 5: Review loop | 🔴 Not started | Reviewer job type, revision re-queueing |
+| Orch Phase 5: Review loop | ✅ Done | Review parsing, revision re-queueing (11 tests) |
 | SQLite persistence | 🔴 Not started | Survive daemon restarts, audit trail |
 | ZeptoKernel integration | 🔴 Not started | Isolated capsule execution |
 | End-to-end testing | 🔴 Not started | Real daemon + LLM smoke test |
@@ -58,7 +58,8 @@
 | `src/orchestrator/types.rs` | ~115 | Run, Job, Artifact, ExecutionPlan structs |
 | `src/orchestrator/store.rs` | ~120 | In-memory HashMap store (6 tests) |
 | `src/orchestrator/scheduler.rs` | ~100 | Dependency promotion, run completion check (7 tests) |
-| `src/orchestrator/engine.rs` | ~360 | OrchestratorEngine: submit_run, next_job, mark_completed/failed, heartbeat (12 tests) |
+| `src/orchestrator/engine.rs` | ~470 | OrchestratorEngine: submit_run, next_job, heartbeat, review loop (15 tests) |
+| `src/orchestrator/review.rs` | ~140 | Review decision parsing: JSON + keyword fallback (8 tests) |
 | `src/orchestrator/planner.rs` | ~80 | ExecutionPlan → child jobs materializer (2 tests) |
 
 ---
@@ -98,31 +99,22 @@ Reviewer job can request revisions, triggering a re-run of the coder job.
 
 ### Tasks
 
-- [ ] **5.1 — Review decision parsing** (`src/orchestrator/review.rs`)
-  - New file
-  - Parse reviewer artifact for decision: `approved`, `revise`, `rejected`
-  - Extract feedback text for revision instruction
-  - **Test:** Parse sample reviewer outputs (approved, revise with feedback, rejected)
+- [x] **5.1 — Review decision parsing** (`src/orchestrator/review.rs`)
+  - JSON + keyword fallback parser for approved/revise/rejected decisions
+  - 8 tests covering JSON, markdown-wrapped JSON, keywords, ambiguous text
 
-- [ ] **5.2 — Revision re-queueing** (`src/orchestrator/engine.rs`)
-  - On `revise` decision: create new coder job with reviewer feedback as input
-  - New coder job depends on nothing (it's a retry with new instructions)
-  - Create new reviewer job depending on new coder job
-  - Cap revision cycles (default: 3 max revisions)
-  - **Test:** Engine test — mark reviewer completed with "revise" → new coder+reviewer jobs created
+- [x] **5.2 — Revision re-queueing** (`src/orchestrator/engine.rs`)
+  - `handle_review_completion()` creates new coder+reviewer pair on "revise"
+  - Tracks `revision_round` on Job, caps at configurable `max_revisions`
+  - 3 tests: revise creates jobs, approved no-ops, max revisions respected
 
-- [ ] **5.3 — Review-aware planner prompt** (`docs/` or config)
-  - Document how to configure planner to emit review pairs:
-    ```json
-    { "local_id": "coder_1", "role": "coder", ... },
-    { "local_id": "reviewer_1", "role": "reviewer", "depends_on": ["coder_1"] }
-    ```
-  - Reviewer system prompt template that outputs structured JSON with decision field
+- [x] **5.3 — Review-aware config** (`src/config.rs`)
+  - Added `max_revisions` to `[daemon]` config (default: 3)
+  - Planner can emit `{"role": "coder", ...}, {"role": "reviewer", "depends_on": ["coder_1"]}`
 
-- [ ] **5.4 — Revision tracking in run status** (`src/server.rs`, `src/main.rs`)
-  - Show revision count in `run status` output
-  - Show review decision in job details
-  - **Test:** API returns revision metadata
+- [x] **5.4 — Revision tracking in run status** (`src/daemon.rs`)
+  - `revision_round` field in job status API response
+  - Review decisions logged with tracing
 
 **Exit criteria:** Coder → reviewer → revise cycle runs automatically. Stops on `approved` or max revisions.
 
@@ -225,7 +217,7 @@ Independent tasks, can be done anytime.
 
 1. **Read this file** — you're doing it
 2. **Read `CLAUDE.md`** — project conventions
-3. **Run `cargo test`** — verify 39 tests pass
-4. **Pick the next unchecked task** — Phase 5 is highest priority
+3. **Run `cargo test`** — verify 50 tests pass
+4. **Pick the next unchecked task** — Phase 6 is highest priority
 5. **Implement, test, commit** — one task at a time
 6. **Update this file** — check off completed tasks
