@@ -1,5 +1,6 @@
 pub mod types;
 pub mod store;
+pub mod sqlite_store;
 pub mod scheduler;
 pub mod planner;
 pub mod review;

@@ -53,6 +53,90 @@ pub async fn run(config_path: String, bind: Option<String>) {
   let mut orchestrator = OrchestratorEngine::new(4);
   let (orch_event_tx, mut orch_event_rx) = mpsc::channel::<serde_json::Value>(256);
 
+  // Initialize SQLite persistence
+  let db_path = dirs::home_dir()
+    .unwrap_or_else(|| std::path::PathBuf::from("."))
+    .join(".zeptopm")
+    .join("zeptopm.db");
+  let db = match crate::orchestrator::sqlite_store::SqlitePersistence::new(
+    &db_path.to_string_lossy(),
+  ) {
+    Ok(db) => {
+      if let Err(e) = db.init_schema() {
+        warn!(error = %e, "failed to init SQLite schema — running without persistence");
+        None
+      } else {
+        info!(path = %db_path.display(), "SQLite persistence enabled");
+        Some(db)
+      }
+    }
+    Err(e) => {
+      warn!(error = %e, "failed to open SQLite — running without persistence");
+      None
+    }
+  };
+
+  // Hydrate orchestrator from SQLite (resume after restart)
+  if let Some(ref db) = db {
+    let mut hydrated_runs = 0u32;
+    let mut hydrated_jobs = 0u32;
+    let mut resumed_runs = 0u32;
+
+    if let Ok(runs) = db.load_runs() {
+      for run in runs {
+        hydrated_runs += 1;
+        orchestrator.store.create_run(run);
+      }
+    }
+    if let Ok(jobs) = db.load_jobs() {
+      for job in jobs {
+        hydrated_jobs += 1;
+        // Running jobs from a previous daemon session are dead — mark failed for retry
+        if job.status == crate::orchestrator::types::JobStatus::Running {
+          let mut failed_job = job;
+          failed_job.error = Some("daemon restarted — process lost".into());
+          if failed_job.attempt < failed_job.max_attempts {
+            failed_job.status = crate::orchestrator::types::JobStatus::Ready;
+            failed_job.finished_at = None;
+            orchestrator.ready_queue.push_back(failed_job.job_id.clone());
+          } else {
+            failed_job.status = crate::orchestrator::types::JobStatus::Failed;
+            failed_job.finished_at = Some(std::time::SystemTime::now());
+          }
+          orchestrator.store.create_job(failed_job);
+        } else if job.status == crate::orchestrator::types::JobStatus::Ready {
+          orchestrator.ready_queue.push_back(job.job_id.clone());
+          orchestrator.store.create_job(job);
+        } else {
+          orchestrator.store.create_job(job);
+        }
+      }
+    }
+    if let Ok(artifacts) = db.load_artifacts() {
+      for artifact in artifacts {
+        orchestrator.store.create_artifact(artifact);
+      }
+    }
+
+    // Count incomplete runs for logging
+    for run in orchestrator.store.list_runs() {
+      if run.status == crate::orchestrator::types::RunStatus::Running
+        || run.status == crate::orchestrator::types::RunStatus::Pending
+      {
+        resumed_runs += 1;
+      }
+    }
+
+    if hydrated_runs > 0 {
+      info!(
+        runs = hydrated_runs,
+        jobs = hydrated_jobs,
+        resumed = resumed_runs,
+        "hydrated orchestrator from SQLite"
+      );
+    }
+  }
+
   // Spawn auto_start agents
   for agent_config in &config.agents {
     if !agent_config.auto_start {
@@ -231,6 +315,11 @@ pub async fn run(config_path: String, bind: Option<String>) {
               spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
             }
 
+            // Persist to SQLite
+            if let Some(ref db) = db {
+              db.persist_run_state(&orchestrator.store, &run_id).ok();
+            }
+
             let _ = reply.send(Ok(run_id));
           }
           DaemonCommand::GetRunStatus { run_id, reply } => {
@@ -344,11 +433,19 @@ pub async fn run(config_path: String, bind: Option<String>) {
               orchestrator.mark_running(&job.job_id);
               spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
             }
+
+            // Persist run state to SQLite
+            if let Some(ref db) = db {
+              db.persist_run_state(&orchestrator.store, &run_id).ok();
+            }
           }
           "job_failed" => {
-            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
+            let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let run_id = orchestrator.store.get_job(&job_id)
+              .map(|j| j.run_id.clone())
+              .unwrap_or_default();
             let error = event.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-            orchestrator.mark_failed(job_id, error.to_string());
+            orchestrator.mark_failed(&job_id, error.to_string());
             warn!(job_id = %job_id, error = %error, "job failed");
 
             // Spawn retry if re-queued
@@ -356,6 +453,11 @@ pub async fn run(config_path: String, bind: Option<String>) {
               info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry)");
               orchestrator.mark_running(&job.job_id);
               spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
+            }
+
+            // Persist to SQLite
+            if let Some(ref db) = db {
+              db.persist_run_state(&orchestrator.store, &run_id).ok();
             }
           }
           "artifact_produced" => {
@@ -372,6 +474,9 @@ pub async fn run(config_path: String, bind: Option<String>) {
               summary: event.get("summary").and_then(|v| v.as_str()).unwrap_or("").into(),
               created_at: std::time::SystemTime::now(),
             };
+            if let Some(ref db) = db {
+              db.persist_artifact(&artifact).ok();
+            }
             orchestrator.store.create_artifact(artifact);
           }
           _ => {}
@@ -395,6 +500,9 @@ pub async fn run(config_path: String, bind: Option<String>) {
         let stale = orchestrator.stale_jobs(Duration::from_secs(120));
         for job_id in stale {
           warn!(job_id = %job_id, "job heartbeat timeout — marking failed");
+          let run_id = orchestrator.store.get_job(&job_id)
+            .map(|j| j.run_id.clone())
+            .unwrap_or_default();
           // Kill the worker process
           let worker_name = format!("__job_{}", job_id);
           if let Some(internal) = managed.get(&worker_name) {
@@ -407,6 +515,11 @@ pub async fn run(config_path: String, bind: Option<String>) {
             info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry after timeout)");
             orchestrator.mark_running(&job.job_id);
             spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
+          }
+
+          // Persist to SQLite
+          if let Some(ref db) = db {
+            db.persist_run_state(&orchestrator.store, &run_id).ok();
           }
         }
 
