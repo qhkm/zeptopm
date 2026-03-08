@@ -36,6 +36,10 @@ pub struct DaemonConfig {
   /// Path to the zk-guest binary (required when isolation = "capsule").
   #[serde(default)]
   pub worker_binary: Option<String>,
+  /// Path to the ZeptoClaw worker binary. Injected as ZEPTOCLAW_BINARY in spec.env
+  /// so the guest agent can locate it inside a namespace (execv does not inherit env).
+  #[serde(default)]
+  pub zeptoclaw_binary: Option<String>,
   /// Auto-delete completed/failed runs older than N days (0 = disabled).
   #[serde(default)]
   pub run_ttl_days: u32,
@@ -52,6 +56,7 @@ impl Default for DaemonConfig {
       max_revisions: default_max_revisions(),
       isolation: default_isolation(),
       worker_binary: None,
+      zeptoclaw_binary: None,
       run_ttl_days: 0,
     }
   }
@@ -82,6 +87,15 @@ pub struct AgentConfig {
   pub session_persist: bool,
   #[serde(default)]
   pub max_history: Option<usize>,
+  /// Memory limit for capsule jobs (MiB). None = unlimited.
+  #[serde(default)]
+  pub memory_mib: Option<u64>,
+  /// Max process count inside capsule. None = unlimited.
+  #[serde(default)]
+  pub max_pids: Option<u32>,
+  /// Wall clock timeout for capsule jobs (seconds). None = use default (300s).
+  #[serde(default)]
+  pub timeout_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -184,20 +198,23 @@ pub fn validate_config(config: &Config) -> Vec<String> {
 
   // Validate isolation config
   match config.daemon.isolation.as_str() {
-    "none" | "capsule" => {}
+    "none" | "capsule" | "process" | "namespace" => {}
     other => {
       errors.push(format!(
-        "daemon.isolation: unknown value '{}' (expected \"none\" or \"capsule\")",
+        "daemon.isolation: unknown value '{}' (expected \"none\", \"process\", \"namespace\", or \"capsule\")",
         other
       ));
     }
   }
 
-  // Capsule mode requires worker_binary
-  if config.daemon.isolation == "capsule" && config.daemon.worker_binary.is_none() {
-    errors.push(
-      "daemon.isolation = \"capsule\" requires daemon.worker_binary to be set".into()
-    );
+  // process/namespace/capsule modes require worker_binary
+  if matches!(config.daemon.isolation.as_str(), "capsule" | "process" | "namespace")
+    && config.daemon.worker_binary.is_none()
+  {
+    errors.push(format!(
+      "daemon.isolation = {:?} requires daemon.worker_binary to be set",
+      config.daemon.isolation
+    ));
   }
 
   errors
@@ -341,6 +358,9 @@ mod tests {
         gateway: None,
         session_persist: true,
         max_history: None,
+        memory_mib: None,
+        max_pids: None,
+        timeout_sec: None,
       }],
       providers: HashMap::new(),
     };
@@ -366,6 +386,9 @@ mod tests {
       gateway: None,
       session_persist: true,
       max_history: None,
+      memory_mib: None,
+      max_pids: None,
+      timeout_sec: None,
     };
     let config = Config {
       daemon: DaemonConfig::default(),
@@ -408,6 +431,9 @@ mod tests {
         gateway: None,
         session_persist: true,
         max_history: None,
+        memory_mib: None,
+        max_pids: None,
+        timeout_sec: None,
       }],
       providers: {
         let mut m = HashMap::new();
@@ -466,5 +492,100 @@ mod tests {
       base_url: None,
     };
     assert_eq!(provider.resolve_api_key(), Some("sk-1234".into()));
+  }
+
+  #[test]
+  fn test_daemon_config_zeptoclaw_binary() {
+    let toml_str = r#"
+[daemon]
+isolation = "process"
+worker_binary = "/usr/bin/zk-guest"
+zeptoclaw_binary = "/usr/bin/zeptoclaw"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(
+      config.daemon.zeptoclaw_binary.as_deref(),
+      Some("/usr/bin/zeptoclaw")
+    );
+  }
+
+  #[test]
+  fn test_daemon_config_zeptoclaw_binary_optional() {
+    let toml_str = r#"
+[daemon]
+isolation = "process"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(config.daemon.zeptoclaw_binary.is_none());
+  }
+
+  #[test]
+  fn test_agent_config_resource_limits() {
+    let toml_str = r#"
+[[agents]]
+name = "researcher"
+memory_mib = 512
+max_pids = 64
+timeout_sec = 600
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let agent = &config.agents[0];
+    assert_eq!(agent.memory_mib, Some(512));
+    assert_eq!(agent.max_pids, Some(64));
+    assert_eq!(agent.timeout_sec, Some(600));
+  }
+
+  #[test]
+  fn test_validation_accepts_process_isolation() {
+    let toml_str = r#"
+[daemon]
+isolation = "process"
+worker_binary = "/usr/bin/zk-guest"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let errors = validate_config(&config);
+    assert!(errors.is_empty(), "errors: {:?}", errors);
+  }
+
+  #[test]
+  fn test_validation_accepts_namespace_isolation() {
+    let toml_str = r#"
+[daemon]
+isolation = "namespace"
+worker_binary = "/usr/bin/zk-guest"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let errors = validate_config(&config);
+    assert!(errors.is_empty(), "errors: {:?}", errors);
+  }
+
+  #[test]
+  fn test_validation_namespace_requires_worker_binary() {
+    let toml_str = r#"
+[daemon]
+isolation = "namespace"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let errors = validate_config(&config);
+    assert!(
+      errors.iter().any(|e| e.contains("worker_binary")),
+      "expected worker_binary error, got: {:?}",
+      errors
+    );
+  }
+
+  #[test]
+  fn test_validation_rejects_unknown_isolation() {
+    let toml_str = r#"
+[daemon]
+isolation = "firecracker"
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    let errors = validate_config(&config);
+    assert!(
+      errors.iter().any(|e| e.contains("isolation")),
+      "expected isolation error, got: {:?}",
+      errors
+    );
   }
 }
