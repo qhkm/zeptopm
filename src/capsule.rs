@@ -42,6 +42,13 @@ pub fn job_to_spec(job: &Job, input_artifact_paths: Vec<String>, config: &crate:
 
   // Find the agent profile matching this job's profile_id
   let agent = config.agents.iter().find(|a| a.name == job.profile_id);
+  if agent.is_none() {
+    warn!(
+      job_id = %job.job_id,
+      profile_id = %job.profile_id,
+      "no agent profile matched — using default resource limits; check that profile_id matches an [[agents]] name in config"
+    );
+  }
 
   // Build resource limits from agent profile (or defaults)
   let limits = ResourceLimits {
