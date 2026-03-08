@@ -780,7 +780,7 @@ async fn spawn_job_worker(
   // Capsule mode — delegate to ZeptoKernel
   if config.daemon.isolation == "capsule" {
     let guest_binary = config.daemon.worker_binary.as_deref().unwrap_or("zk-guest");
-    crate::capsule::spawn_capsule_job(job, guest_binary, orch_event_tx, orchestrator_store).await;
+    crate::capsule::spawn_capsule_job(job, guest_binary, orch_event_tx, orchestrator_store, config).await;
     return;
   }
 

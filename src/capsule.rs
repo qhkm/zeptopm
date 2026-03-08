@@ -17,7 +17,14 @@ use crate::orchestrator::store::RunStore;
 use crate::orchestrator::types::Job;
 
 /// Convert a ZeptoPM `Job` to a ZeptoKernel `JobSpec`.
-pub fn job_to_spec(job: &Job, input_artifact_paths: Vec<String>) -> JobSpec {
+///
+/// Pulls resource limits from the matching `AgentConfig` in `config.agents`
+/// (matched by `job.profile_id == agent.name`). Falls back to defaults when
+/// no matching agent profile is found.
+///
+/// Injects `ZEPTOCLAW_BINARY` into `spec.env` when `config.daemon.zeptoclaw_binary`
+/// is set, so the guest agent can locate the worker binary inside the capsule.
+pub fn job_to_spec(job: &Job, input_artifact_paths: Vec<String>, config: &crate::config::Config) -> JobSpec {
   let input_artifacts = input_artifact_paths
     .into_iter()
     .enumerate()
@@ -33,8 +40,24 @@ pub fn job_to_spec(job: &Job, input_artifact_paths: Vec<String>) -> JobSpec {
     })
     .collect();
 
+  // Find the agent profile matching this job's profile_id
+  let agent = config.agents.iter().find(|a| a.name == job.profile_id);
+
+  // Build resource limits from agent profile (or defaults)
+  let limits = ResourceLimits {
+    memory_mib: agent.and_then(|a| a.memory_mib),
+    max_pids: agent.and_then(|a| a.max_pids),
+    timeout_sec: agent
+      .and_then(|a| a.timeout_sec)
+      .unwrap_or(crate::config::DEFAULT_CAPSULE_TIMEOUT_SEC),
+    heartbeat_timeout_sec: 60,
+    cpu_quota: None,
+    network: false,
+    max_output_bytes: None,
+  };
+
   // Pass ZeptoPM env to the capsule (provider keys, etc.)
-  let env: HashMap<String, String> = std::env::vars()
+  let mut env: HashMap<String, String> = std::env::vars()
     .filter(|(k, _)| {
       k.starts_with("OPENROUTER_")
         || k.starts_with("OPENAI_")
@@ -44,6 +67,11 @@ pub fn job_to_spec(job: &Job, input_artifact_paths: Vec<String>) -> JobSpec {
     })
     .collect();
 
+  // Inject ZEPTOCLAW_BINARY so the guest agent can locate the worker
+  if let Some(zeptoclaw) = config.daemon.zeptoclaw_binary.as_deref() {
+    env.insert("ZEPTOCLAW_BINARY".into(), zeptoclaw.into());
+  }
+
   JobSpec {
     job_id: job.job_id.clone(),
     run_id: job.run_id.clone(),
@@ -52,7 +80,7 @@ pub fn job_to_spec(job: &Job, input_artifact_paths: Vec<String>) -> JobSpec {
     instruction: job.instruction.clone(),
     input_artifacts,
     env,
-    limits: ResourceLimits::default(),
+    limits,
     workspace: WorkspaceConfig {
       guest_path: job.workspace_dir.clone(),
       size_mib: None,
@@ -70,6 +98,7 @@ pub async fn spawn_capsule_job(
   guest_binary: &str,
   orch_event_tx: mpsc::Sender<serde_json::Value>,
   orchestrator_store: &RunStore,
+  config: &crate::config::Config,
 ) {
   let input_artifacts: Vec<String> = job
     .input_artifact_ids
@@ -78,7 +107,7 @@ pub async fn spawn_capsule_job(
     .map(|a| a.path.to_string_lossy().to_string())
     .collect();
 
-  let spec = job_to_spec(job, input_artifacts);
+  let spec = job_to_spec(job, input_artifacts, config);
   let guest_binary = guest_binary.to_string();
   let job_id = job.job_id.clone();
 
@@ -192,10 +221,48 @@ mod tests {
     }
   }
 
+  fn make_test_config_full(isolation: &str) -> crate::config::Config {
+    crate::config::Config {
+      daemon: crate::config::DaemonConfig {
+        isolation: isolation.into(),
+        worker_binary: Some("/usr/bin/zk-guest".into()),
+        zeptoclaw_binary: Some("/usr/bin/zeptoclaw".into()),
+        poll_interval_ms: 5000,
+        log_level: "info".into(),
+        log_format: "pretty".into(),
+        bind: None,
+        sessions_dir: None,
+        max_revisions: 3,
+        run_ttl_days: 0,
+      },
+      agents: vec![crate::config::AgentConfig {
+        name: "coder-agent".into(),
+        provider: "openrouter".into(),
+        model: None,
+        system_prompt: None,
+        tools: vec![],
+        auto_start: true,
+        max_restarts: 5,
+        restart_backoff_ms: 10_000,
+        max_iterations: None,
+        timeout_ms: None,
+        budget: None,
+        gateway: None,
+        session_persist: true,
+        max_history: None,
+        memory_mib: Some(512),
+        max_pids: Some(64),
+        timeout_sec: Some(600),
+      }],
+      providers: Default::default(),
+    }
+  }
+
   #[test]
   fn test_job_to_spec_basic_mapping() {
     let job = make_test_job();
-    let spec = job_to_spec(&job, vec!["/tmp/input.md".into()]);
+    let config = make_test_config_full("process");
+    let spec = job_to_spec(&job, vec!["/tmp/input.md".into()], &config);
 
     assert_eq!(spec.job_id, "job_1");
     assert_eq!(spec.run_id, "run_1");
@@ -215,7 +282,8 @@ mod tests {
   fn test_job_to_spec_no_artifacts() {
     let mut job = make_test_job();
     job.input_artifact_ids.clear();
-    let spec = job_to_spec(&job, vec![]);
+    let config = make_test_config_full("process");
+    let spec = job_to_spec(&job, vec![], &config);
 
     assert!(spec.input_artifacts.is_empty());
   }
@@ -224,7 +292,8 @@ mod tests {
   fn test_job_to_spec_env_passthrough() {
     // HOME and PATH should always be present
     let job = make_test_job();
-    let spec = job_to_spec(&job, vec![]);
+    let config = make_test_config_full("process");
+    let spec = job_to_spec(&job, vec![], &config);
 
     // At minimum HOME should be set in the test env
     assert!(spec.env.contains_key("HOME") || spec.env.contains_key("PATH"));
@@ -233,10 +302,56 @@ mod tests {
   #[test]
   fn test_job_to_spec_default_limits() {
     let job = make_test_job();
-    let spec = job_to_spec(&job, vec![]);
+    let config = make_test_config_full("process");
+    let spec = job_to_spec(&job, vec![], &config);
 
-    assert_eq!(spec.limits.timeout_sec, 300);
+    // Agent profile has timeout_sec = 600, so it should use that
+    assert_eq!(spec.limits.timeout_sec, 600);
     assert_eq!(spec.limits.heartbeat_timeout_sec, 60);
     assert!(!spec.limits.network);
+  }
+
+  #[test]
+  fn test_job_to_spec_with_limits() {
+    let job = make_test_job();
+    let config = make_test_config_full("process");
+    let spec = job_to_spec(&job, vec![], &config);
+
+    assert_eq!(spec.limits.memory_mib, Some(512));
+    assert_eq!(spec.limits.max_pids, Some(64));
+    assert_eq!(spec.limits.timeout_sec, 600);
+  }
+
+  #[test]
+  fn test_job_to_spec_injects_zeptoclaw_binary() {
+    let job = make_test_job();
+    let config = make_test_config_full("process");
+    let spec = job_to_spec(&job, vec![], &config);
+
+    assert_eq!(
+      spec.env.get("ZEPTOCLAW_BINARY").map(String::as_str),
+      Some("/usr/bin/zeptoclaw")
+    );
+  }
+
+  #[test]
+  fn test_job_to_spec_no_zeptoclaw_binary() {
+    let job = make_test_job();
+    let mut config = make_test_config_full("process");
+    config.daemon.zeptoclaw_binary = None;
+    let spec = job_to_spec(&job, vec![], &config);
+
+    assert!(!spec.env.contains_key("ZEPTOCLAW_BINARY"));
+  }
+
+  #[test]
+  fn test_job_to_spec_default_limits_when_no_agent_profile() {
+    let job = make_test_job(); // profile_id = "coder-agent"
+    let mut config = make_test_config_full("process");
+    config.agents.clear(); // no matching agent
+    let spec = job_to_spec(&job, vec![], &config);
+
+    assert!(spec.limits.memory_mib.is_none());
+    assert_eq!(spec.limits.timeout_sec, crate::config::DEFAULT_CAPSULE_TIMEOUT_SEC);
   }
 }
