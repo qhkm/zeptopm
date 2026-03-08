@@ -98,11 +98,17 @@ enum RunAction {
   Submit {
     /// Task description
     task: String,
+    /// Stream run progress in real-time
+    #[arg(short, long)]
+    tail: bool,
   },
   /// Check status of a run
   Status {
     /// Run ID
     run_id: String,
+    /// Stream run progress in real-time
+    #[arg(short, long)]
+    tail: bool,
   },
   /// List all runs
   List,
@@ -377,34 +383,40 @@ async fn main() {
     }
     Some(Commands::Run { action }) => {
       match action {
-        RunAction::Submit { task } => {
+        RunAction::Submit { task, tail } => {
           let body = serde_json::json!({ "task": task });
-          match http_post(&cli.addr, "/runs", &body).await {
+          let run_id = match http_post(&cli.addr, "/runs", &body).await {
             Ok(resp_body) => {
               let resp: serde_json::Value = serde_json::from_str(&resp_body).unwrap_or_default();
               if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
                 eprintln!("Error: {}", error);
                 std::process::exit(1);
               }
-              if let Some(run_id) = resp.get("run_id").and_then(|v| v.as_str()) {
-                println!("Run submitted: {}", run_id);
-              }
+              let id = resp.get("run_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+              println!("Run submitted: {}", id);
+              id
+            }
+            Err(e) => {
+              eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
+              std::process::exit(1);
+            }
+          };
+          if tail && !run_id.is_empty() {
+            tail_run(&cli.addr, &run_id).await;
+          }
+        }
+        RunAction::Status { run_id, tail } => {
+          match http_get(&cli.addr, &format!("/runs/{}", run_id)).await {
+            Ok(resp_body) => {
+              print_run_status(&resp_body);
             }
             Err(e) => {
               eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
               std::process::exit(1);
             }
           }
-        }
-        RunAction::Status { run_id } => {
-          match http_get(&cli.addr, &format!("/runs/{}", run_id)).await {
-            Ok(resp_body) => {
-              println!("{}", resp_body);
-            }
-            Err(e) => {
-              eprintln!("Failed to connect to daemon at {}: {}", cli.addr, e);
-              std::process::exit(1);
-            }
+          if tail {
+            tail_run(&cli.addr, &run_id).await;
           }
         }
         RunAction::List => {
@@ -465,6 +477,104 @@ async fn main() {
       init_tracing(log_level, &config.daemon.log_format);
 
       zeptopm::daemon::run(cli.config, None).await;
+    }
+  }
+}
+
+/// Print a formatted run status snapshot.
+fn print_run_status(body: &str) {
+  let resp: serde_json::Value = match serde_json::from_str(body) {
+    Ok(v) => v,
+    Err(_) => { println!("{}", body); return; }
+  };
+  if let Some(error) = resp.get("error").and_then(|v| v.as_str()) {
+    eprintln!("Error: {}", error);
+    return;
+  }
+
+  let status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+  let task = resp.get("task").and_then(|v| v.as_str()).unwrap_or("?");
+  let run_id = resp.get("run_id").and_then(|v| v.as_str()).unwrap_or("?");
+
+  println!("Run: {}  Status: {}", run_id, status);
+  println!("Task: {}", task);
+
+  if let Some(jobs) = resp.get("jobs").and_then(|v| v.as_array()) {
+    if !jobs.is_empty() {
+      println!("\n{:<24} {:<12} {:<12} {}", "JOB ID", "ROLE", "STATUS", "INSTRUCTION");
+      println!("{}", "-".repeat(80));
+      for job in jobs {
+        let jid = job.get("job_id").and_then(|v| v.as_str()).unwrap_or("?");
+        let role = job.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+        let st = job.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+        let instr = job.get("instruction").and_then(|v| v.as_str()).unwrap_or("");
+        let short_instr: String = instr.chars().take(40).collect();
+        println!("{:<24} {:<12} {:<12} {}", jid, role, st, short_instr);
+      }
+    }
+  }
+}
+
+/// Follow a run's progress in real-time by polling.
+async fn tail_run(addr: &str, run_id: &str) {
+  use std::collections::HashMap;
+
+  println!("\nFollowing run {}... (Ctrl+C to stop)\n", run_id);
+
+  let mut seen_statuses: HashMap<String, String> = HashMap::new();
+  let mut last_run_status = String::new();
+
+  loop {
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let body = match http_get(addr, &format!("/runs/{}", run_id)).await {
+      Ok(b) => b,
+      Err(e) => {
+        eprintln!("  [poll error: {}]", e);
+        continue;
+      }
+    };
+
+    let resp: serde_json::Value = match serde_json::from_str(&body) {
+      Ok(v) => v,
+      Err(_) => continue,
+    };
+
+    let run_status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+
+    // Check for job-level changes
+    if let Some(jobs) = resp.get("jobs").and_then(|v| v.as_array()) {
+      for job in jobs {
+        let jid = job.get("job_id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        let role = job.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+        let st = job.get("status").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        let prev = seen_statuses.get(&jid).map(|s| s.as_str()).unwrap_or("");
+
+        if prev != st {
+          let now = chrono::Local::now().format("%H:%M:%S");
+          match st.as_str() {
+            "Running" => println!("  {} [{}] {} starting...", now, role, jid),
+            "Completed" => println!("  {} [{}] {} completed", now, role, jid),
+            "Failed" => {
+              let err = job.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+              println!("  {} [{}] {} FAILED: {}", now, role, jid, err);
+            }
+            "Ready" => println!("  {} [{}] {} ready (queued)", now, role, jid),
+            _ => println!("  {} [{}] {} -> {}", now, role, jid, st),
+          }
+          seen_statuses.insert(jid, st);
+        }
+      }
+    }
+
+    // Check run-level status change
+    if run_status != last_run_status {
+      if run_status == "Completed" || run_status == "Failed" || run_status == "Cancelled" {
+        let now = chrono::Local::now().format("%H:%M:%S");
+        println!("\n  {} Run {} -> {}", now, run_id, run_status);
+        break;
+      }
+      last_run_status = run_status;
     }
   }
 }
