@@ -43,6 +43,12 @@ pub struct DaemonConfig {
     /// Auto-delete completed/failed runs older than N days (0 = disabled).
     #[serde(default)]
     pub run_ttl_days: u32,
+    /// Security profile: "dev", "standard" (default), or "hardened".
+    #[serde(default)]
+    pub security: Option<String>,
+    /// Override: whether cgroup setup failure is fatal.
+    #[serde(default)]
+    pub cgroup_required: Option<bool>,
 }
 
 impl Default for DaemonConfig {
@@ -58,6 +64,8 @@ impl Default for DaemonConfig {
             worker_binary: None,
             zeptoclaw_binary: None,
             run_ttl_days: 0,
+            security: None,
+            cgroup_required: None,
         }
     }
 }

@@ -16,8 +16,8 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use zeptokernel::{
-    CapsuleReport, CapsuleSpec, Isolation, ResourceLimits, ResourceViolation, Signal,
-    WorkspaceConfig,
+    CapsuleReport, CapsuleSpec, Isolation, ResourceLimits, ResourceViolation, SecurityOverrides,
+    SecurityProfile, Signal, WorkspaceConfig,
 };
 
 use crate::agent::{AgentCommand, AgentHandle};
@@ -40,6 +40,16 @@ pub fn capsule_spec_from_config(config: &crate::config::Config, job: &Job) -> Ca
         _ => Isolation::Process,
     };
 
+    let security = match config.daemon.security.as_deref() {
+        Some("dev") => SecurityProfile::Dev,
+        Some("hardened") => SecurityProfile::Hardened,
+        _ => SecurityProfile::Standard,
+    };
+
+    let security_overrides = SecurityOverrides {
+        cgroup_required: config.daemon.cgroup_required,
+    };
+
     CapsuleSpec {
         isolation,
         workspace: WorkspaceConfig {
@@ -56,6 +66,8 @@ pub fn capsule_spec_from_config(config: &crate::config::Config, job: &Job) -> Ca
             max_pids: agent.and_then(|a| a.max_pids),
         },
         init_binary: namespace_init_binary(config),
+        security,
+        security_overrides,
     }
 }
 
@@ -465,6 +477,8 @@ mod tests {
                 sessions_dir: None,
                 max_revisions: 3,
                 run_ttl_days: 0,
+                security: None,
+                cgroup_required: None,
             },
             agents: vec![crate::config::AgentConfig {
                 name: "coder-agent".into(),
@@ -595,5 +609,22 @@ mod tests {
             translated.get("path").and_then(|value| value.as_str()),
             Some("/tmp/run/job/output.md")
         );
+    }
+
+    #[test]
+    fn test_capsule_spec_security_from_config() {
+        let job = make_test_job();
+        let mut config = make_test_config("namespace");
+        config.daemon.security = Some("hardened".into());
+        let spec = capsule_spec_from_config(&config, &job);
+        assert_eq!(spec.security, zeptokernel::SecurityProfile::Hardened);
+    }
+
+    #[test]
+    fn test_capsule_spec_security_defaults_to_standard() {
+        let job = make_test_job();
+        let config = make_test_config("process");
+        let spec = capsule_spec_from_config(&config, &job);
+        assert_eq!(spec.security, zeptokernel::SecurityProfile::Standard);
     }
 }

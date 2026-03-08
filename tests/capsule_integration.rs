@@ -30,6 +30,8 @@ fn test_config() -> Config {
             sessions_dir: None,
             max_revisions: 3,
             run_ttl_days: 0,
+            security: None,
+            cgroup_required: None,
         },
         agents: vec![AgentConfig {
             name: "researcher".into(),
