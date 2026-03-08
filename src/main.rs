@@ -686,6 +686,87 @@ async fn http_post(addr: &str, path: &str, body: &serde_json::Value) -> Result<S
   resp.text().await.map_err(|e| e.to_string())
 }
 
+/// Structured CLI error for JSON output mode.
+struct CliError {
+    message: String,
+    code: String,
+}
+
+impl CliError {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ok": false,
+            "error": self.message,
+            "code": self.code,
+        })
+    }
+
+    fn daemon_unreachable(addr: &str) -> Self {
+        CliError {
+            message: format!("Failed to connect to daemon at {}", addr),
+            code: "DAEMON_UNREACHABLE".into(),
+        }
+    }
+
+    fn parse_error(detail: &str) -> Self {
+        CliError {
+            message: format!("Failed to parse response: {}", detail),
+            code: "PARSE_ERROR".into(),
+        }
+    }
+
+    fn not_found(kind: &str, id: &str) -> Self {
+        let code = match kind {
+            "run" => "RUN_NOT_FOUND",
+            "agent" => "AGENT_NOT_FOUND",
+            _ => "NOT_FOUND",
+        };
+        CliError {
+            message: format!("{} '{}' not found", kind, id),
+            code: code.into(),
+        }
+    }
+
+    fn invalid_config(detail: &str) -> Self {
+        CliError {
+            message: format!("Invalid config: {}", detail),
+            code: "INVALID_CONFIG".into(),
+        }
+    }
+}
+
+type CliResult = Result<serde_json::Value, CliError>;
+
+/// Format a CliResult as a JSON envelope string.
+fn format_output_json(result: &CliResult) -> String {
+    match result {
+        Ok(data) => {
+            let envelope = serde_json::json!({ "ok": true, "data": data });
+            serde_json::to_string_pretty(&envelope).unwrap()
+        }
+        Err(err) => {
+            serde_json::to_string_pretty(&err.to_json()).unwrap()
+        }
+    }
+}
+
+/// Output a CliResult — JSON envelope if json_mode, otherwise run the human formatter.
+fn output_result(result: CliResult, json_mode: bool, human_fn: impl FnOnce(&serde_json::Value)) {
+    match (json_mode, &result) {
+        (true, _) => {
+            println!("{}", format_output_json(&result));
+            if result.is_err() {
+                std::process::exit(1);
+            }
+        }
+        (false, Ok(data)) => human_fn(data),
+        (false, Err(err)) => {
+            eprintln!("Error: {}", err.message);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn format_uptime(secs: u64) -> String {
   if secs < 60 {
     format!("{}s", secs)
@@ -694,4 +775,43 @@ fn format_uptime(secs: u64) -> String {
   } else {
     format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
   }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_error_to_json() {
+        let err = CliError {
+            message: "Run not found".into(),
+            code: "RUN_NOT_FOUND".into(),
+        };
+        let json = err.to_json();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"], "Run not found");
+        assert_eq!(json["code"], "RUN_NOT_FOUND");
+    }
+
+    #[test]
+    fn test_format_success_json() {
+        let data = serde_json::json!({"run_id": "run_123"});
+        let output = format_output_json(&Ok(data.clone()));
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["data"]["run_id"], "run_123");
+    }
+
+    #[test]
+    fn test_format_error_json() {
+        let err = CliError {
+            message: "Daemon unreachable".into(),
+            code: "DAEMON_UNREACHABLE".into(),
+        };
+        let output = format_output_json(&Err(err));
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["error"], "Daemon unreachable");
+        assert_eq!(parsed["code"], "DAEMON_UNREACHABLE");
+    }
 }
