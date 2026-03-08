@@ -1,6 +1,6 @@
 # ZeptoPM — TODO & Roadmap
 
-> **For agents:** Read this file first when picking up work. Run `cargo test` after every change — all 74 tests must pass before committing.
+> **For agents:** Read this file first when picking up work. Run `cargo test` after every change — all 81 tests must pass before committing.
 
 ## Quick Context
 
@@ -10,7 +10,7 @@
 
 **Stack position:** ZeptoPM (this) → ZeptoKernel (isolation) → ZeptoClaw (worker)
 
-**Current state:** Core PM shipped. Orchestration Phases 1–7 done. All infrastructure tasks done. 74 tests passing. Zero warnings.
+**Current state:** Core PM shipped. Orchestration Phases 1–7 done. All infrastructure tasks done. Agent-native CLI done. 81 tests passing. Zero warnings.
 
 **Design docs:**
 - `docs/plans/2026-03-08-orchestration-design.md` — architecture decisions
@@ -38,6 +38,7 @@
 | ZeptoKernel integration | ✅ Done | Library integration, capsule job runner (4 tests) |
 | Planner validation | ✅ Done | Plan structure validation, retry on malformed (5 tests) |
 | Integration tests | ✅ Done | Full orchestrator flow tests without daemon/LLM (4 tests) |
+| Agent-native CLI | ✅ Done | --json flag, agent-help, --agent-help (7 tests) |
 | End-to-end testing | 🔴 Not started | Real daemon + LLM smoke test |
 
 ---
@@ -46,7 +47,7 @@
 
 | File | Lines | What's there |
 |------|-------|-------------|
-| `src/main.rs` | ~500 | CLI (clap): daemon, status, chat, logs, start/stop, pipeline, orchestrate, run |
+| `src/main.rs` | ~900 | CLI (clap): --json flag, agent-help, all commands with JSON envelope (7 tests) |
 | `src/lib.rs` | ~10 | Module exports |
 | `src/capsule.rs` | ~160 | ZeptoKernel integration: Job→JobSpec mapping, capsule job runner (4 tests) |
 | `src/config.rs` | ~200 | TOML parsing, $ENV_VAR expansion, validation (5 tests) |
@@ -221,7 +222,7 @@ Independent tasks, can be done anytime.
 
 1. **Read this file** — you're doing it
 2. **Read `CLAUDE.md`** — project conventions
-3. **Run `cargo test`** — verify 74 tests pass
+3. **Run `cargo test`** — verify 81 tests pass
 4. **Pick the next unchecked task** — Phase 7 or Infrastructure tasks
 5. **Implement, test, commit** — one task at a time
 6. **Update this file** — check off completed tasks

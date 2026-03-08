@@ -33,7 +33,7 @@ Standalone Rust binary (~11 MB). No external dependencies on zeptoRT or erlangrt
 
 ```bash
 cargo build                           # build
-cargo test                            # run all 74 tests
+cargo test                            # run all 81 tests
 cargo run -- daemon                   # start with default config
 cargo run -- daemon -c config.toml    # custom config
 cargo run -- status                   # show agents
@@ -43,6 +43,9 @@ cargo run -- run status <run_id>      # check run progress
 cargo run -- run list                 # list all runs
 cargo run -- run result <run_id>      # print artifact content
 cargo run -- run cancel <run_id>      # cancel a running run
+cargo run -- agent-help               # full CLI manifest for AI agents (JSON)
+cargo run -- status --json            # machine-readable JSON output
+cargo run -- status --agent-help      # command schema for AI agents
 ```
 
 ## Config Format
