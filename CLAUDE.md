@@ -6,35 +6,73 @@ zeptoPM is a process manager for AI agents — like PM2 for Node.js, but for LLM
 
 ## Architecture
 
-Standalone Rust binary. No external dependencies on zeptoRT or erlangrt.
+Standalone Rust binary (~11 MB). No external dependencies on zeptoRT or erlangrt. ~4 MB RSS per worker process.
 
-- `config.rs` — TOML config parsing and validation
-- `llm.rs` — Direct HTTP client for OpenRouter/OpenAI-compatible APIs (reqwest)
-- `agent.rs` — Agent process management (spawn as tokio tasks, message handling)
-- `daemon.rs` — Main orchestration loop (spawn agents, monitor, restart, config reload)
-- `status.rs` — Status display formatting
+### Core modules
+- `config.rs` — TOML config parsing, $ENV_VAR expansion, validation (5 tests)
+- `llm.rs` — HTTP client for OpenAI-compatible APIs (reqwest)
+- `provider.rs` — LLM provider factory
+- `agent.rs` — Process spawn, worker bridge, JSON-line IPC (3 tests)
+- `worker.rs` — Worker process, session persistence, ZeptoAgent integration, job_execute handler
+- `daemon.rs` — Supervisor loop, config reload, orchestrator integration
+- `server.rs` — Axum HTTP API, run endpoints, gateway auth, rate limiting
+- `status.rs` — Status display formatting (2 tests)
 - `main.rs` — CLI entry point (clap)
+
+### Orchestrator modules (`src/orchestrator/`)
+- `types.rs` — Run, Job, Artifact, ExecutionPlan structs
+- `store.rs` — In-memory HashMap store (6 tests)
+- `scheduler.rs` — Dependency promotion, run completion check (7 tests)
+- `engine.rs` — OrchestratorEngine: submit_run, next_job, mark_completed/failed (8 tests)
+- `planner.rs` — ExecutionPlan → child jobs materializer (2 tests)
 
 ## Build & Run
 
 ```bash
-cargo build
-cargo run -- daemon                    # start with default config
-cargo run -- daemon -c myconfig.toml   # custom config
-cargo run -- status                    # show configured agents
-cargo run -- list                      # list agent names
-cargo test                             # run all tests
+cargo build                           # build
+cargo test                            # run all 35 tests
+cargo run -- daemon                   # start with default config
+cargo run -- daemon -c config.toml    # custom config
+cargo run -- status                   # show agents
+cargo run -- chat <name> "message"    # chat with agent
+cargo run -- run submit "task"        # submit orchestrated run
+cargo run -- run status <run_id>      # check run progress
+cargo run -- run list                 # list all runs
 ```
 
 ## Config Format
 
 See `zeptopm.toml` for the full example. Key sections:
-- `[daemon]` — poll interval, log level
+- `[daemon]` — poll interval, log level, max_concurrent_jobs
 - `[[agents]]` — agent definitions (name, provider, model, system_prompt, tools, budget)
 - `[providers.*]` — API keys and base URLs (supports `$ENV_VAR` expansion)
 
+## Key Design Docs
+
+- `docs/plans/2026-03-08-orchestration-design.md` — architecture decisions
+- `docs/plans/2026-03-08-orchestration-impl.md` — implementation tasks
+- `docs/plans/2026-03-08-use-cases-and-benefits.md` — use cases, competitive positioning
+- `TODO.md` — current roadmap with task-level breakdown
+
 ## Relationship to Other Projects
 
-- **zeptoRT** (~/ios/zeptoclaw-rt) — Enterprise durable runtime. zeptoPM is the simple PM2-style interface; zeptoRT is the deep Temporal-style runtime.
-- **Symphony** (OpenAI) — Inspiration for the daemon/orchestrator pattern.
-- Future: zeptoPM can optionally use zeptoRT as its backend for durability.
+- **ZeptoKernel** (~/ios/zeptokernel) — Secure per-worker execution capsule. Future: zeptoPM spawns jobs inside ZeptoKernel capsules for isolation.
+- **ZeptoClaw** — AI worker binary. The actual task executor inside capsules.
+- **zeptoRT** (~/ios/zeptoclaw-rt) — Enterprise durable runtime (Erlang-inspired). Separate from zeptoPM.
+
+## IPC Protocol
+
+Supervisor ↔ worker communication via JSON lines on stdin/stdout:
+
+**Supervisor → Worker:**
+- `{"type": "chat", "message": "..."}` — chat request
+- `{"type": "job_execute", "job_id": "...", "instruction": "...", "workspace": "...", "input_artifacts": [...]}` — orchestrated job
+
+**Worker → Supervisor:**
+- `{"type": "ready"}` — worker initialized
+- `{"type": "chat_response", "message": "..."}` — chat reply
+- `{"type": "artifact_produced", "job_id": "...", "artifact_id": "...", "kind": "...", "path": "...", "summary": "..."}` — output artifact
+- `{"type": "job_completed", "job_id": "...", "output_artifact_ids": [...]}` — job done
+- `{"type": "job_failed", "job_id": "...", "error": "...", "retryable": bool}` — job failed
+- `{"type": "status", "status": "idle|running", "message": "..."}` — status update
+- `{"type": "log", "level": "info|error", "message": "..."}` — log entry
