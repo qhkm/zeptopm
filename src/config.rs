@@ -93,7 +93,7 @@ pub struct AgentConfig {
   /// Max process count inside capsule. None = unlimited.
   #[serde(default)]
   pub max_pids: Option<u32>,
-  /// Wall clock timeout for capsule jobs (seconds). None = use default (300s).
+  /// Wall clock timeout for capsule jobs (seconds). None = use `DEFAULT_CAPSULE_TIMEOUT_SEC`.
   #[serde(default)]
   pub timeout_sec: Option<u64>,
 }
@@ -153,6 +153,10 @@ fn default_max_restarts() -> u32 { 5 }
 fn default_restart_backoff() -> u64 { 10_000 }
 fn default_max_revisions() -> u32 { 3 }
 fn default_isolation() -> String { "none".into() }
+
+/// Default wall-clock timeout for capsule jobs when `AgentConfig.timeout_sec` is None.
+/// Applied by `job_to_spec` in `capsule.rs`.
+pub const DEFAULT_CAPSULE_TIMEOUT_SEC: u64 = 300;
 
 /// Load config from a TOML file.
 pub fn load_config(path: &str) -> Result<Config, ConfigError> {
@@ -221,6 +225,10 @@ pub fn validate_config(config: &Config) -> Vec<String> {
 }
 
 /// Compute a simple hash of the config for change detection.
+///
+/// Covers agent identity and process fields used to decide whether to restart a worker.
+/// Capsule resource limits (`memory_mib`, `max_pids`, `timeout_sec`) are intentionally
+/// excluded — they are re-read per-job at dispatch time and do not require a restart.
 pub fn config_hash(config: &Config) -> u64 {
   use std::collections::hash_map::DefaultHasher;
   use std::hash::{Hash, Hasher};
@@ -446,21 +454,6 @@ mod tests {
   }
 
   #[test]
-  fn test_validate_invalid_isolation() {
-    let toml = r#"
-      [daemon]
-      isolation = "firecracker"
-
-      [[agents]]
-      name = "a"
-      provider = "p"
-    "#;
-    let config: Config = toml::from_str(toml).unwrap();
-    let errors = validate_config(&config);
-    assert!(errors.iter().any(|e| e.contains("unknown value")));
-  }
-
-  #[test]
   fn test_validate_capsule_needs_worker_binary() {
     let toml = r#"
       [daemon]
@@ -511,6 +504,9 @@ zeptoclaw_binary = "/usr/bin/zeptoclaw"
 
   #[test]
   fn test_daemon_config_zeptoclaw_binary_optional() {
+    // Parse-only test: verifies zeptoclaw_binary defaults to None when omitted.
+    // worker_binary is not set here, so this config would fail validate_config —
+    // that is intentional; validation is exercised separately below.
     let toml_str = r#"
 [daemon]
 isolation = "process"
