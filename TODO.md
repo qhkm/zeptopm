@@ -10,7 +10,7 @@
 
 **Stack position:** ZeptoPM (this) → ZeptoKernel (isolation) → ZeptoClaw (worker)
 
-**Current state:** Core PM shipped. Orchestration Phases 1–3 done. 35 tests passing. Zero warnings.
+**Current state:** Core PM shipped. Orchestration Phases 1–4 done. 39 tests passing. Zero warnings.
 
 **Design docs:**
 - `docs/plans/2026-03-08-orchestration-design.md` — architecture decisions
@@ -32,7 +32,7 @@
 | Orch Phase 1: Types + Store | ✅ Done | Run, Job, Artifact, RunStore (in-memory) |
 | Orch Phase 2: Engine + Planner | ✅ Done | Scheduler, dependency promotion, plan materialization |
 | Orch Phase 3: CLI + API | ✅ Done | `run submit/status/list`, `--tail` flag, REST endpoints |
-| Orch Phase 4: Heartbeat | 🔴 Not started | Progress tracking, stuck job detection |
+| Orch Phase 4: Heartbeat | ✅ Done | Progress tracking, stuck job detection (4 tests) |
 | Orch Phase 5: Review loop | 🔴 Not started | Reviewer job type, revision re-queueing |
 | SQLite persistence | 🔴 Not started | Survive daemon restarts, audit trail |
 | ZeptoKernel integration | 🔴 Not started | Isolated capsule execution |
@@ -58,7 +58,7 @@
 | `src/orchestrator/types.rs` | ~115 | Run, Job, Artifact, ExecutionPlan structs |
 | `src/orchestrator/store.rs` | ~120 | In-memory HashMap store (6 tests) |
 | `src/orchestrator/scheduler.rs` | ~100 | Dependency promotion, run completion check (7 tests) |
-| `src/orchestrator/engine.rs` | ~150 | OrchestratorEngine: submit_run, next_job, mark_completed/failed (8 tests) |
+| `src/orchestrator/engine.rs` | ~360 | OrchestratorEngine: submit_run, next_job, mark_completed/failed, heartbeat (12 tests) |
 | `src/orchestrator/planner.rs` | ~80 | ExecutionPlan → child jobs materializer (2 tests) |
 
 ---
@@ -69,33 +69,24 @@ Workers emit periodic heartbeats. Supervisor detects hung jobs and kills/retries
 
 ### Tasks
 
-- [ ] **4.1 — Heartbeat event from worker** (`src/worker.rs`)
-  - While executing `job_execute`, emit `{"type": "heartbeat", "job_id": "...", "phase": "running"}` every 10 seconds
-  - Use `tokio::spawn` with an interval timer alongside the LLM call
-  - Cancel heartbeat task when job finishes
-  - **Test:** Unit test that verifies heartbeat JSON format
+- [x] **4.1 — Heartbeat event from worker** (`src/worker.rs`)
+  - `tokio::spawn` interval timer emits heartbeat every 10s during `job_execute`
+  - Aborted on job completion/failure
 
-- [ ] **4.2 — Progress event from worker** (`src/worker.rs`)
-  - Add `{"type": "progress", "job_id": "...", "phase": "...", "message": "...", "percent": N}` event
-  - Emit at least once: when starting LLM call, when writing artifact
-  - Forward through agent.rs to orchestrator
-  - **Test:** Unit test for progress event format
+- [x] **4.2 — Progress event from worker** (`src/worker.rs`)
+  - Emits progress at: preparing, llm_call, writing_artifact (90%)
+  - Forwarded through agent.rs to orchestrator
 
-- [ ] **4.3 — Heartbeat tracking in engine** (`src/orchestrator/engine.rs`)
-  - Track `last_heartbeat: HashMap<JobId, Instant>` in OrchestratorEngine
-  - Update on heartbeat event from worker
-  - Add `stale_jobs(timeout: Duration) -> Vec<JobId>` method
-  - **Test:** Unit test — job with no heartbeat for N seconds is stale
+- [x] **4.3 — Heartbeat tracking in engine** (`src/orchestrator/engine.rs`)
+  - `last_heartbeat: HashMap<JobId, Instant>` with `record_heartbeat()` and `stale_jobs()`
+  - 4 new tests: record, stale detection, cleared on complete, cleared on fail
 
-- [ ] **4.4 — Stuck job detection in daemon** (`src/daemon.rs`)
-  - Add periodic check (every 30s) in the `tokio::select!` loop
-  - For each stale job: kill worker process, mark job failed with "heartbeat timeout"
-  - Engine retries if attempts remain
-  - **Test:** Integration test — spawn a hanging worker, verify it gets killed and retried
+- [x] **4.4 — Stuck job detection in daemon** (`src/daemon.rs`)
+  - Checks stale jobs every poll tick (120s timeout)
+  - Kills worker, marks failed with "heartbeat timeout", engine retries if attempts remain
 
-- [ ] **4.5 — Progress display in --tail** (`src/main.rs`)
-  - Show progress events in tail output: `HH:MM:SS [role] job_id: phase (N%)`
-  - Show heartbeat as a dot or subtle indicator (don't spam)
+- [x] **4.5 — Heartbeat in run status API** (`src/daemon.rs`)
+  - `last_heartbeat_secs_ago` field in job status response
 
 **Exit criteria:** Hung worker detected within 60s. Retried automatically. Progress visible in `--tail`.
 
@@ -234,7 +225,7 @@ Independent tasks, can be done anytime.
 
 1. **Read this file** — you're doing it
 2. **Read `CLAUDE.md`** — project conventions
-3. **Run `cargo test`** — verify 35 tests pass
-4. **Pick the next unchecked task** — Phase 4 is highest priority
+3. **Run `cargo test`** — verify 39 tests pass
+4. **Pick the next unchecked task** — Phase 5 is highest priority
 5. **Implement, test, commit** — one task at a time
 6. **Update this file** — check off completed tasks

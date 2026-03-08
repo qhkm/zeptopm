@@ -23,14 +23,14 @@ Standalone Rust binary (~11 MB). No external dependencies on zeptoRT or erlangrt
 - `types.rs` — Run, Job, Artifact, ExecutionPlan structs
 - `store.rs` — In-memory HashMap store (6 tests)
 - `scheduler.rs` — Dependency promotion, run completion check (7 tests)
-- `engine.rs` — OrchestratorEngine: submit_run, next_job, mark_completed/failed (8 tests)
+- `engine.rs` — OrchestratorEngine: submit_run, next_job, mark_completed/failed, heartbeat tracking (12 tests)
 - `planner.rs` — ExecutionPlan → child jobs materializer (2 tests)
 
 ## Build & Run
 
 ```bash
 cargo build                           # build
-cargo test                            # run all 35 tests
+cargo test                            # run all 39 tests
 cargo run -- daemon                   # start with default config
 cargo run -- daemon -c config.toml    # custom config
 cargo run -- status                   # show agents
