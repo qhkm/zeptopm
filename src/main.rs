@@ -20,6 +20,14 @@ struct Cli {
   /// Daemon HTTP address (for CLI commands to connect to)
   #[arg(long, default_value = "127.0.0.1:9876", global = true)]
   addr: String,
+
+  /// Output results as JSON (machine-readable)
+  #[arg(long, global = true)]
+  json: bool,
+
+  /// Show command schema for AI agents (JSON)
+  #[arg(long, global = true)]
+  agent_help: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -80,6 +88,8 @@ enum Commands {
     #[command(subcommand)]
     action: RunAction,
   },
+  /// Show full CLI manifest for AI agents (JSON)
+  AgentHelp,
   /// Internal: run a single agent as a worker process
   #[command(hide = true)]
   Worker {
@@ -152,6 +162,43 @@ fn init_tracing(level: &str, format: &str) {
 #[tokio::main]
 async fn main() {
   let cli = Cli::parse();
+
+  if cli.agent_help {
+      let manifest = build_manifest();
+      let cmd_name = match &cli.command {
+          Some(Commands::Status) => Some("status"),
+          Some(Commands::List) => Some("list"),
+          Some(Commands::Chat { .. }) => Some("chat"),
+          Some(Commands::Stop { .. }) => Some("stop"),
+          Some(Commands::Start { .. }) => Some("start"),
+          Some(Commands::Restart { .. }) => Some("restart"),
+          Some(Commands::Logs { .. }) => Some("logs"),
+          Some(Commands::Pipeline { .. }) => Some("pipeline"),
+          Some(Commands::Orchestrate { .. }) => Some("orchestrate"),
+          Some(Commands::Run { action }) => {
+              Some(match action {
+                  RunAction::Submit { .. } => "run submit",
+                  RunAction::Status { .. } => "run status",
+                  RunAction::List => "run list",
+                  RunAction::Result { .. } => "run result",
+                  RunAction::Cancel { .. } => "run cancel",
+              })
+          }
+          _ => None,
+      };
+
+      if let Some(name) = cmd_name {
+          if let Some(cmd_spec) = manifest["commands"].get(name) {
+              let entry = serde_json::json!({ name: cmd_spec });
+              println!("{}", serde_json::to_string_pretty(&entry).unwrap());
+          } else {
+              println!("{}", serde_json::to_string_pretty(&manifest).unwrap());
+          }
+      } else {
+          println!("{}", serde_json::to_string_pretty(&manifest).unwrap());
+      }
+      return;
+  }
 
   match cli.command {
     Some(Commands::Daemon { bind }) => {
@@ -519,6 +566,10 @@ async fn main() {
         }
       }
     }
+    Some(Commands::AgentHelp) => {
+      let manifest = build_manifest();
+      println!("{}", serde_json::to_string_pretty(&manifest).unwrap());
+    }
     Some(Commands::Worker { agent, config }) => {
       zeptopm::worker::run(agent, config).await;
     }
@@ -686,6 +737,159 @@ async fn http_post(addr: &str, path: &str, body: &serde_json::Value) -> Result<S
   resp.text().await.map_err(|e| e.to_string())
 }
 
+/// Build the full CLI manifest for agent discovery.
+fn build_manifest() -> serde_json::Value {
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "commands": {
+            "status": {
+                "description": "Show status of all running agents (queries daemon)",
+                "args": [],
+                "flags": ["--json"],
+                "output_shape": {
+                    "agents": [{"name": "str", "status": "str", "restarts": "int", "tokens_used": "int", "uptime_secs": "int"}]
+                }
+            },
+            "list": {
+                "description": "List configured agents from config file (no daemon needed)",
+                "args": [],
+                "flags": ["--json"],
+                "output_shape": {
+                    "agents": [{"name": "str", "auto_start": "bool", "provider": "str", "model": "str"}]
+                }
+            },
+            "chat": {
+                "description": "Send a message to an agent and get the response",
+                "args": [
+                    {"name": "name", "type": "string", "required": true, "description": "Agent name"},
+                    {"name": "message", "type": "string", "required": true, "description": "Message to send"}
+                ],
+                "flags": ["--json"],
+                "output_shape": {"response": "str"}
+            },
+            "stop": {
+                "description": "Stop a running agent",
+                "args": [{"name": "name", "type": "string", "required": true, "description": "Agent name"}],
+                "flags": ["--json"],
+                "output_shape": {"status": "str"}
+            },
+            "start": {
+                "description": "Start an agent (must be defined in config)",
+                "args": [{"name": "name", "type": "string", "required": true, "description": "Agent name"}],
+                "flags": ["--json"],
+                "output_shape": {"status": "str"}
+            },
+            "restart": {
+                "description": "Restart an agent (stop + start)",
+                "args": [{"name": "name", "type": "string", "required": true, "description": "Agent name"}],
+                "flags": ["--json"],
+                "output_shape": {"status": "str"}
+            },
+            "logs": {
+                "description": "Show recent logs for an agent",
+                "args": [{"name": "name", "type": "string", "required": true, "description": "Agent name"}],
+                "flags": ["--json"],
+                "output_shape": {
+                    "logs": [{"timestamp": "str", "level": "str", "message": "str"}]
+                }
+            },
+            "pipeline": {
+                "description": "Chain agents in a pipeline (output of one feeds into the next)",
+                "args": [
+                    {"name": "agents", "type": "string", "required": true, "description": "Comma-separated agent names"},
+                    {"name": "message", "type": "string", "required": true, "description": "Message to start the pipeline"}
+                ],
+                "flags": ["--json"],
+                "output_shape": {
+                    "steps": [{"agent": "str", "response": "str"}]
+                }
+            },
+            "orchestrate": {
+                "description": "Orchestrate multi-agent collaboration (manager delegates to other agents)",
+                "args": [
+                    {"name": "manager", "type": "string", "required": true, "description": "Manager agent name"},
+                    {"name": "message", "type": "string", "required": true, "description": "Task for the manager"}
+                ],
+                "flags": ["--json"],
+                "output_shape": {
+                    "response": "str",
+                    "delegations": [{"to": "str", "query": "str", "result": "str"}],
+                    "rounds": "int"
+                }
+            },
+            "run submit": {
+                "description": "Submit a new orchestrated run",
+                "args": [{"name": "task", "type": "string", "required": true, "description": "Task description"}],
+                "flags": ["--tail", "--json"],
+                "output_shape": {"run_id": "str"}
+            },
+            "run status": {
+                "description": "Check status of a run",
+                "args": [{"name": "run_id", "type": "string", "required": true, "description": "Run ID"}],
+                "flags": ["--tail", "--json"],
+                "output_shape": {
+                    "run_id": "str", "status": "str", "task": "str",
+                    "jobs": [{"job_id": "str", "role": "str", "status": "str", "instruction": "str"}]
+                }
+            },
+            "run list": {
+                "description": "List all runs",
+                "args": [],
+                "flags": ["--json"],
+                "output_shape": {
+                    "runs": [{"run_id": "str", "status": "str", "task": "str"}]
+                }
+            },
+            "run result": {
+                "description": "Print final artifact content for a completed run",
+                "args": [{"name": "run_id", "type": "string", "required": true, "description": "Run ID"}],
+                "flags": ["--json"],
+                "output_shape": {
+                    "status": "str",
+                    "artifacts": [{"kind": "str", "summary": "str", "path": "str", "content": "str"}]
+                }
+            },
+            "run cancel": {
+                "description": "Cancel a running run (cancels all active jobs)",
+                "args": [{"name": "run_id", "type": "string", "required": true, "description": "Run ID"}],
+                "flags": ["--json"],
+                "output_shape": {"status": "str"}
+            }
+        },
+        "workflows": {
+            "submit_and_wait": {
+                "description": "Submit a run and poll until completion, then get results",
+                "steps": [
+                    "zeptopm run submit \"<task>\" --json  →  {\"ok\": true, \"data\": {\"run_id\": \"...\"}}",
+                    "zeptopm run status <run_id> --json  →  poll until data.status is \"Completed\", \"Failed\", or \"Cancelled\"",
+                    "zeptopm run result <run_id> --json  →  {\"ok\": true, \"data\": {\"artifacts\": [...]}}"
+                ]
+            },
+            "agent_chat": {
+                "description": "Find an available agent and chat with it",
+                "steps": [
+                    "zeptopm status --json  →  find agents where status is \"running\"",
+                    "zeptopm chat <name> \"<message>\" --json  →  {\"ok\": true, \"data\": {\"response\": \"...\"}}"
+                ]
+            },
+            "monitor_agents": {
+                "description": "Check agent health and investigate issues",
+                "steps": [
+                    "zeptopm status --json  →  check all agent health (restarts, uptime)",
+                    "zeptopm logs <name> --json  →  get recent log entries for a specific agent"
+                ]
+            }
+        },
+        "error_codes": {
+            "DAEMON_UNREACHABLE": "Daemon is not running or address is wrong. Start with: zeptopm daemon",
+            "RUN_NOT_FOUND": "No run with this ID exists",
+            "AGENT_NOT_FOUND": "No agent with this name in config or not running",
+            "INVALID_CONFIG": "Config file is missing or has validation errors",
+            "PARSE_ERROR": "Failed to parse response from daemon"
+        }
+    })
+}
+
 /// Structured CLI error for JSON output mode.
 struct CliError {
     message: String,
@@ -813,5 +1017,53 @@ mod tests {
         assert_eq!(parsed["ok"], false);
         assert_eq!(parsed["error"], "Daemon unreachable");
         assert_eq!(parsed["code"], "DAEMON_UNREACHABLE");
+    }
+
+    #[test]
+    fn test_manifest_has_all_commands() {
+        let manifest = build_manifest();
+        let commands = manifest["commands"].as_object().unwrap();
+        let expected = vec![
+            "status", "list", "chat", "logs",
+            "stop", "start", "restart",
+            "pipeline", "orchestrate",
+            "run submit", "run status", "run list", "run result", "run cancel",
+        ];
+        for cmd in &expected {
+            assert!(commands.contains_key(*cmd), "missing command: {}", cmd);
+        }
+        for (name, spec) in commands {
+            assert!(spec.get("description").is_some(), "{} missing description", name);
+            assert!(spec.get("output_shape").is_some(), "{} missing output_shape", name);
+        }
+    }
+
+    #[test]
+    fn test_manifest_has_workflows() {
+        let manifest = build_manifest();
+        let workflows = manifest["workflows"].as_object().unwrap();
+        assert!(workflows.contains_key("submit_and_wait"));
+        assert!(workflows.contains_key("agent_chat"));
+        assert!(workflows.contains_key("monitor_agents"));
+        for (name, wf) in workflows {
+            assert!(wf.get("steps").and_then(|s| s.as_array()).is_some(), "{} missing steps", name);
+        }
+    }
+
+    #[test]
+    fn test_manifest_has_error_codes() {
+        let manifest = build_manifest();
+        let codes = manifest["error_codes"].as_object().unwrap();
+        assert!(codes.contains_key("DAEMON_UNREACHABLE"));
+        assert!(codes.contains_key("RUN_NOT_FOUND"));
+        assert!(codes.contains_key("AGENT_NOT_FOUND"));
+        assert!(codes.contains_key("INVALID_CONFIG"));
+        assert!(codes.contains_key("PARSE_ERROR"));
+    }
+
+    #[test]
+    fn test_manifest_version_present() {
+        let manifest = build_manifest();
+        assert!(manifest.get("version").and_then(|v| v.as_str()).is_some());
     }
 }
