@@ -58,6 +58,8 @@ pub struct Job {
     pub finished_at: Option<SystemTime>,
     pub output_artifact_ids: Vec<ArtifactId>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub revision_round: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -60,6 +60,7 @@ impl OrchestratorEngine {
             finished_at: None,
             output_artifact_ids: vec![],
             error: None,
+            revision_round: 0,
         };
 
         self.store.create_run(run);
@@ -141,6 +142,94 @@ impl OrchestratorEngine {
             }
             check_run_completion(&mut self.store, &run_id);
         }
+    }
+
+    /// Handle completion of a reviewer job. If the decision is "revise"
+    /// and we haven't exceeded the revision limit, creates new coder + reviewer jobs.
+    /// Returns `(new_coder_id, new_reviewer_id)` if a revision was created.
+    pub fn handle_review_completion(
+        &mut self,
+        reviewer_job_id: &str,
+        decision: crate::orchestrator::review::ReviewDecision,
+        max_revisions: u32,
+    ) -> Option<(JobId, JobId)> {
+        use crate::orchestrator::review::ReviewDecision;
+
+        let feedback = match decision {
+            ReviewDecision::Revise { feedback } => feedback,
+            _ => return None,
+        };
+
+        let reviewer = self.store.get_job(reviewer_job_id)?.clone();
+
+        // Find the coder job this reviewer depends on
+        let coder_job_id = reviewer.depends_on.first()?;
+        let coder = self.store.get_job(coder_job_id)?.clone();
+
+        let new_round = reviewer.revision_round + 1;
+        if new_round > max_revisions {
+            return None;
+        }
+
+        let run_id = reviewer.run_id.clone();
+        let now = SystemTime::now();
+
+        // Create new coder job with original instruction + reviewer feedback
+        let new_coder_id = gen_id("job");
+        let new_coder = Job {
+            job_id: new_coder_id.clone(),
+            run_id: run_id.clone(),
+            parent_job_id: reviewer.parent_job_id.clone(),
+            role: coder.role.clone(),
+            status: JobStatus::Ready,
+            instruction: format!(
+                "{}\n\n--- Reviewer feedback (revision {}/{}) ---\n{}",
+                coder.instruction, new_round, max_revisions, feedback
+            ),
+            input_artifact_ids: coder.output_artifact_ids.clone(),
+            depends_on: vec![],
+            children: vec![],
+            profile_id: coder.profile_id.clone(),
+            workspace_dir: crate::orchestrator::planner::resolve_workspace(&run_id, &new_coder_id),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            started_at: None,
+            finished_at: None,
+            output_artifact_ids: vec![],
+            error: None,
+            revision_round: new_round,
+        };
+
+        // Create new reviewer job depending on the new coder
+        let new_reviewer_id = gen_id("job");
+        let new_reviewer = Job {
+            job_id: new_reviewer_id.clone(),
+            run_id: run_id.clone(),
+            parent_job_id: reviewer.parent_job_id.clone(),
+            role: reviewer.role.clone(),
+            status: JobStatus::Pending,
+            instruction: reviewer.instruction.clone(),
+            input_artifact_ids: vec![],
+            depends_on: vec![new_coder_id.clone()],
+            children: vec![],
+            profile_id: reviewer.profile_id.clone(),
+            workspace_dir: crate::orchestrator::planner::resolve_workspace(&run_id, &new_reviewer_id),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            started_at: None,
+            finished_at: None,
+            output_artifact_ids: vec![],
+            error: None,
+            revision_round: new_round,
+        };
+
+        self.store.create_job(new_coder);
+        self.store.create_job(new_reviewer);
+        self.ready_queue.push_back(new_coder_id.clone());
+
+        Some((new_coder_id, new_reviewer_id))
     }
 
     /// Mark a job as failed. Retries if attempts remain.
@@ -234,6 +323,7 @@ mod tests {
             finished_at: None,
             output_artifact_ids: vec![],
             error: None,
+            revision_round: 0,
         };
         engine.store.create_job(child);
 
@@ -341,6 +431,137 @@ mod tests {
         // On retry, heartbeat is cleared from last_heartbeat (removed from active)
         // but job is re-queued as Ready
         assert!(!engine.last_heartbeat.contains_key(&job.job_id));
+    }
+
+    fn make_coder_reviewer_pair(engine: &mut OrchestratorEngine, run_id: &str, parent_job_id: &str) -> (JobId, JobId) {
+        let coder_id = gen_id("job");
+        let reviewer_id = gen_id("job");
+        let now = SystemTime::now();
+
+        let coder = Job {
+            job_id: coder_id.clone(),
+            run_id: run_id.into(),
+            parent_job_id: Some(parent_job_id.into()),
+            role: "coder".into(),
+            status: JobStatus::Ready,
+            instruction: "Write a function".into(),
+            input_artifact_ids: vec![],
+            depends_on: vec![],
+            children: vec![],
+            profile_id: "coder".into(),
+            workspace_dir: std::path::PathBuf::from("/tmp"),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            started_at: None,
+            finished_at: None,
+            output_artifact_ids: vec![],
+            error: None,
+            revision_round: 0,
+        };
+        let reviewer = Job {
+            job_id: reviewer_id.clone(),
+            run_id: run_id.into(),
+            parent_job_id: Some(parent_job_id.into()),
+            role: "reviewer".into(),
+            status: JobStatus::Pending,
+            instruction: "Review the code".into(),
+            input_artifact_ids: vec![],
+            depends_on: vec![coder_id.clone()],
+            children: vec![],
+            profile_id: "reviewer".into(),
+            workspace_dir: std::path::PathBuf::from("/tmp"),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: now,
+            started_at: None,
+            finished_at: None,
+            output_artifact_ids: vec![],
+            error: None,
+            revision_round: 0,
+        };
+
+        engine.store.create_job(coder);
+        engine.store.create_job(reviewer);
+        engine.ready_queue.push_back(coder_id.clone());
+
+        (coder_id, reviewer_id)
+    }
+
+    #[test]
+    fn test_review_revise_creates_new_jobs() {
+        use crate::orchestrator::review::ReviewDecision;
+
+        let mut engine = OrchestratorEngine::new(4);
+        let run_id = engine.submit_run("test".into());
+        let planner = engine.next_job().unwrap();
+
+        let (coder_id, reviewer_id) = make_coder_reviewer_pair(&mut engine, &run_id, &planner.job_id);
+
+        // Simulate: coder completes, reviewer completes with "revise"
+        engine.active_jobs.insert(coder_id.clone(), run_id.clone());
+        engine.mark_running(&coder_id);
+        engine.mark_completed(&coder_id, vec!["art_1".into()]);
+
+        engine.active_jobs.insert(reviewer_id.clone(), run_id.clone());
+        engine.mark_running(&reviewer_id);
+        engine.mark_completed(&reviewer_id, vec![]);
+
+        let decision = ReviewDecision::Revise {
+            feedback: "Add error handling".into(),
+        };
+        let result = engine.handle_review_completion(&reviewer_id, decision, 3);
+        assert!(result.is_some());
+
+        let (new_coder_id, new_reviewer_id) = result.unwrap();
+
+        let new_coder = engine.store.get_job(&new_coder_id).unwrap();
+        assert_eq!(new_coder.role, "coder");
+        assert_eq!(new_coder.status, JobStatus::Ready);
+        assert_eq!(new_coder.revision_round, 1);
+        assert!(new_coder.instruction.contains("Add error handling"));
+
+        let new_reviewer = engine.store.get_job(&new_reviewer_id).unwrap();
+        assert_eq!(new_reviewer.role, "reviewer");
+        assert_eq!(new_reviewer.status, JobStatus::Pending);
+        assert_eq!(new_reviewer.depends_on, vec![new_coder_id]);
+        assert_eq!(new_reviewer.revision_round, 1);
+    }
+
+    #[test]
+    fn test_review_approved_no_new_jobs() {
+        use crate::orchestrator::review::ReviewDecision;
+
+        let mut engine = OrchestratorEngine::new(4);
+        let run_id = engine.submit_run("test".into());
+        let planner = engine.next_job().unwrap();
+
+        let (_coder_id, reviewer_id) = make_coder_reviewer_pair(&mut engine, &run_id, &planner.job_id);
+
+        let result = engine.handle_review_completion(&reviewer_id, ReviewDecision::Approved, 3);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_review_max_revisions_reached() {
+        use crate::orchestrator::review::ReviewDecision;
+
+        let mut engine = OrchestratorEngine::new(4);
+        let run_id = engine.submit_run("test".into());
+        let planner = engine.next_job().unwrap();
+
+        let (_coder_id, reviewer_id) = make_coder_reviewer_pair(&mut engine, &run_id, &planner.job_id);
+
+        // Set reviewer's revision_round to max
+        if let Some(j) = engine.store.get_job_mut(&reviewer_id) {
+            j.revision_round = 3;
+        }
+
+        let decision = ReviewDecision::Revise {
+            feedback: "Still needs work".into(),
+        };
+        let result = engine.handle_review_completion(&reviewer_id, decision, 3);
+        assert!(result.is_none()); // max revisions reached
     }
 
     #[test]

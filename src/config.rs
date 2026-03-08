@@ -28,6 +28,8 @@ pub struct DaemonConfig {
   pub bind: Option<String>,
   #[serde(default)]
   pub sessions_dir: Option<String>,
+  #[serde(default = "default_max_revisions")]
+  pub max_revisions: u32,
 }
 
 impl Default for DaemonConfig {
@@ -38,6 +40,7 @@ impl Default for DaemonConfig {
       log_format: default_log_format(),
       bind: None,
       sessions_dir: None,
+      max_revisions: default_max_revisions(),
     }
   }
 }
@@ -122,6 +125,7 @@ fn default_provider() -> String { "openrouter".into() }
 fn default_true() -> bool { true }
 fn default_max_restarts() -> u32 { 5 }
 fn default_restart_backoff() -> u64 { 10_000 }
+fn default_max_revisions() -> u32 { 3 }
 
 /// Load config from a TOML file.
 pub fn load_config(path: &str) -> Result<Config, ConfigError> {

@@ -305,6 +305,39 @@ pub async fn run(config_path: String, bind: Option<String>) {
               }
             }
 
+            // Check if completed job is a reviewer — handle review loop
+            let is_reviewer = orchestrator.store.get_job(&job_id)
+              .map(|j| j.role == "reviewer")
+              .unwrap_or(false);
+
+            if is_reviewer {
+              if let Some(artifact_id) = orchestrator.store.get_job(&job_id)
+                .and_then(|j| j.output_artifact_ids.first().cloned())
+              {
+                if let Some(artifact) = orchestrator.store.get_artifact(&artifact_id) {
+                  let review_text = std::fs::read_to_string(&artifact.path).unwrap_or_default();
+                  let decision = crate::orchestrator::review::parse_review_decision(&review_text);
+                  let max_revisions = current_config.daemon.max_revisions;
+
+                  match &decision {
+                    crate::orchestrator::review::ReviewDecision::Revise { feedback } => {
+                      if let Some((coder_id, reviewer_id)) = orchestrator.handle_review_completion(&job_id, decision.clone(), max_revisions) {
+                        info!(job_id = %job_id, new_coder = %coder_id, new_reviewer = %reviewer_id, "reviewer requested revision — new jobs created");
+                      } else {
+                        info!(job_id = %job_id, feedback = %feedback, "reviewer requested revision but max revisions reached");
+                      }
+                    }
+                    crate::orchestrator::review::ReviewDecision::Approved => {
+                      info!(job_id = %job_id, "reviewer approved");
+                    }
+                    crate::orchestrator::review::ReviewDecision::Rejected { reason } => {
+                      warn!(job_id = %job_id, reason = %reason, "reviewer rejected");
+                    }
+                  }
+                }
+              }
+            }
+
             // Spawn newly ready jobs
             while let Some(job) = orchestrator.next_job() {
               info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
@@ -624,6 +657,7 @@ fn get_run_status_data(
       "status": format!("{:?}", j.status),
       "instruction": j.instruction.chars().take(100).collect::<String>(),
       "attempt": j.attempt,
+      "revision_round": j.revision_round,
       "error": j.error,
       "last_heartbeat_secs_ago": last_hb_secs,
     })

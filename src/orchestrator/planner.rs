@@ -55,6 +55,7 @@ pub fn materialize_plan(
             finished_at: None,
             output_artifact_ids: vec![],
             error: None,
+            revision_round: 0,
         };
 
         store.create_job(job);

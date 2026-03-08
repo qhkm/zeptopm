@@ -99,6 +99,7 @@ mod tests {
             finished_at: None,
             output_artifact_ids: vec![],
             error: None,
+            revision_round: 0,
         }
     }
 
