@@ -10,11 +10,52 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use zk_host::process_backend::ProcessBackend;
-use zk_host::supervisor::{JobOutcome, Supervisor};
+use zk_host::supervisor::{JobOutcome, Supervisor, SupervisorError};
+#[cfg(all(target_os = "linux", feature = "namespace"))]
+use zk_host::namespace_backend::NamespaceBackend;
 use zk_proto::{JobSpec, ResourceLimits, WorkspaceConfig};
 
 use crate::orchestrator::store::RunStore;
 use crate::orchestrator::types::Job;
+
+/// Backend selector for capsule job execution.
+///
+/// Enum-dispatch avoids trait objects (Backend has an associated Handle type).
+/// Adding Firecracker in M6 = one new variant + one new match arm.
+pub enum CapsuleBackend {
+    Process(ProcessBackend),
+    #[cfg(all(target_os = "linux", feature = "namespace"))]
+    Namespace(NamespaceBackend),
+}
+
+impl CapsuleBackend {
+    /// Run a capsule job through this backend's Supervisor.
+    pub async fn run_job(
+        &self,
+        spec: &JobSpec,
+        worker_binary: &str,
+    ) -> Result<JobOutcome, SupervisorError> {
+        let mut supervisor = Supervisor::new();
+        match self {
+            Self::Process(b) => supervisor.run_job(b, spec, worker_binary).await,
+            #[cfg(all(target_os = "linux", feature = "namespace"))]
+            Self::Namespace(b) => supervisor.run_job(b, spec, worker_binary).await,
+        }
+    }
+}
+
+/// Create the backend based on `daemon.isolation` config.
+///
+/// Falls back to `ProcessBackend` on macOS regardless of the isolation setting,
+/// since `NamespaceBackend` is Linux-only.
+pub fn make_backend(config: &crate::config::Config) -> CapsuleBackend {
+    let guest = config.daemon.worker_binary.as_deref().unwrap_or("zk-guest");
+    match config.daemon.isolation.as_str() {
+        #[cfg(all(target_os = "linux", feature = "namespace"))]
+        "namespace" => CapsuleBackend::Namespace(NamespaceBackend::new(guest)),
+        _ => CapsuleBackend::Process(ProcessBackend::new(guest)),
+    }
+}
 
 /// Convert a ZeptoPM `Job` to a ZeptoKernel `JobSpec`.
 ///
@@ -360,5 +401,35 @@ mod tests {
 
     assert!(spec.limits.memory_mib.is_none());
     assert_eq!(spec.limits.timeout_sec, crate::config::DEFAULT_CAPSULE_TIMEOUT_SEC);
+  }
+
+  #[test]
+  fn test_make_backend_process_isolation() {
+    let config = make_test_config_full("process");
+    let backend = make_backend(&config);
+    assert!(matches!(backend, CapsuleBackend::Process(_)));
+  }
+
+  #[test]
+  fn test_make_backend_capsule_alias() {
+    // "capsule" is a backward-compat alias for "process"
+    let config = make_test_config_full("capsule");
+    let backend = make_backend(&config);
+    assert!(matches!(backend, CapsuleBackend::Process(_)));
+  }
+
+  #[test]
+  fn test_make_backend_none_fallback() {
+    let config = make_test_config_full("none");
+    let backend = make_backend(&config);
+    assert!(matches!(backend, CapsuleBackend::Process(_)));
+  }
+
+  #[cfg(all(target_os = "linux", feature = "namespace"))]
+  #[test]
+  fn test_make_backend_namespace_isolation() {
+    let config = make_test_config_full("namespace");
+    let backend = make_backend(&config);
+    assert!(matches!(backend, CapsuleBackend::Namespace(_)));
   }
 }
