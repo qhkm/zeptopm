@@ -558,11 +558,13 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                   .unwrap_or_default();
                 let error = event.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
                 managed.remove(&format!("__job_{}", job_id));
+
+                // Handle channel peer failure before mark_failed, which may
+                // deactivate channels and cause channels_for_job() to skip them.
+                handle_channel_peer_failures!(orchestrator, managed, job_id);
+
                 orchestrator.mark_failed(&job_id, error.to_string());
                 warn!(job_id = %job_id, error = %error, "job failed");
-
-                // Handle channel peer failure for the failed job
-                handle_channel_peer_failures!(orchestrator, managed, job_id);
 
                 // Spawn retry if re-queued
                 while let Some(job) = orchestrator.next_job() {
@@ -654,10 +656,12 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                 internal.handle.stop().await;
               }
               managed.remove(&worker_name);
-              orchestrator.mark_failed(&job_id, "heartbeat timeout".into());
 
-              // Handle channel peer failure for the timed-out job
+              // Handle channel peer failure before mark_failed, which may
+              // deactivate channels and cause channels_for_job() to skip them.
               handle_channel_peer_failures!(orchestrator, managed, job_id);
+
+              orchestrator.mark_failed(&job_id, "heartbeat timeout".into());
 
               // Spawn retries if re-queued
               while let Some(job) = orchestrator.next_job() {
