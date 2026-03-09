@@ -154,6 +154,7 @@ mod tests {
                     depends_on: vec!["research".into()],
                 },
             ],
+            channels: vec![],
         };
         let job_ids = materialize_plan(&mut store, "run_1", "planner_job", &plan);
         assert_eq!(job_ids.len(), 2);
@@ -197,6 +198,7 @@ mod tests {
                     depends_on: vec!["r1".into(), "r2".into()],
                 },
             ],
+            channels: vec![],
         };
         let job_ids = materialize_plan(&mut store, "run_1", "planner_job", &plan);
         assert_eq!(job_ids.len(), 3);
@@ -219,13 +221,17 @@ mod tests {
                 instruction: "Write code".into(),
                 depends_on: vec![],
             }],
+            channels: vec![],
         };
         assert!(validate_plan(&plan).is_empty());
     }
 
     #[test]
     fn test_validate_empty_plan() {
-        let plan = ExecutionPlan { jobs: vec![] };
+        let plan = ExecutionPlan {
+            jobs: vec![],
+            channels: vec![],
+        };
         let errors = validate_plan(&plan);
         assert!(errors.iter().any(|e| e.contains("no jobs")));
     }
@@ -240,6 +246,7 @@ mod tests {
                 instruction: "Write code".into(),
                 depends_on: vec!["nonexistent".into()],
             }],
+            channels: vec![],
         };
         let errors = validate_plan(&plan);
         assert!(errors.iter().any(|e| e.contains("not found in plan")));
@@ -255,6 +262,7 @@ mod tests {
                 instruction: "Write code".into(),
                 depends_on: vec!["a".into()],
             }],
+            channels: vec![],
         };
         let errors = validate_plan(&plan);
         assert!(errors.iter().any(|e| e.contains("depends on itself")));
@@ -270,6 +278,7 @@ mod tests {
                 instruction: "".into(),
                 depends_on: vec![],
             }],
+            channels: vec![],
         };
         let errors = validate_plan(&plan);
         assert!(errors.len() >= 3); // role, profile_id, instruction

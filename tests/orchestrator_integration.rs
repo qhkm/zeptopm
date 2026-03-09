@@ -47,6 +47,7 @@ fn test_full_run_lifecycle() {
                 depends_on: vec!["research".into()],
             },
         ],
+        channels: vec![],
     };
 
     // Validate the plan
@@ -130,6 +131,7 @@ fn test_invalid_plan_rejected() {
             instruction: "Do something".into(),
             depends_on: vec!["missing_dep".into()],
         }],
+        channels: vec![],
     };
     let errors = planner::validate_plan(&plan);
     assert!(!errors.is_empty());
@@ -170,6 +172,7 @@ fn test_parallel_execution() {
                 depends_on: vec!["r1".into(), "r2".into()],
             },
         ],
+        channels: vec![],
     };
 
     assert!(planner::validate_plan(&plan).is_empty());
