@@ -142,6 +142,29 @@ pub fn materialize_plan(
         created.push(real_id);
     }
 
+    // Materialize channels — translate local_ids to real job IDs
+    for planned_ch in &plan.channels {
+        let real_participants: Vec<JobId> = planned_ch
+            .participants
+            .iter()
+            .filter_map(|local| id_map.get(local).cloned())
+            .collect();
+
+        let channel = Channel {
+            channel_id: planned_ch.channel_id.clone(),
+            run_id: run_id.into(),
+            participants: real_participants,
+            mode: planned_ch.mode.clone(),
+            max_rounds: planned_ch.max_rounds,
+            on_peer_failure: planned_ch.on_peer_failure.clone(),
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: false,
+            history: vec![],
+        };
+        store.create_channel(channel);
+    }
+
     created
 }
 
@@ -440,5 +463,68 @@ mod tests {
         };
         let errors = validate_plan(&plan);
         assert!(errors.iter().any(|e| e.contains("TurnBased") && e.contains("at least 2")));
+    }
+
+    #[test]
+    fn test_materialize_plan_creates_channels() {
+        let mut store = RunStore::new();
+        let plan = ExecutionPlan {
+            jobs: vec![
+                PlannedJob {
+                    local_id: "writer".into(),
+                    role: "writer".into(),
+                    profile_id: "writer".into(),
+                    instruction: "Write draft".into(),
+                    depends_on: vec![],
+                },
+                PlannedJob {
+                    local_id: "reviewer".into(),
+                    role: "reviewer".into(),
+                    profile_id: "reviewer".into(),
+                    instruction: "Review draft".into(),
+                    depends_on: vec![],
+                },
+            ],
+            channels: vec![PlannedChannel {
+                channel_id: "draft-review".into(),
+                participants: vec!["writer".into(), "reviewer".into()],
+                mode: ChannelMode::TurnBased,
+                max_rounds: Some(3),
+                on_peer_failure: PeerFailure::KillAll,
+                initial_message: Some("Write a blog post about Rust".into()),
+            }],
+        };
+
+        let job_ids = materialize_plan(&mut store, "run_1", "planner_job", &plan);
+        assert_eq!(job_ids.len(), 2);
+
+        // Channel should be created with real job IDs (not local_ids)
+        let channels = store.list_run_channels("run_1");
+        assert_eq!(channels.len(), 1);
+        let ch = channels[0];
+        assert_eq!(ch.channel_id, "draft-review");
+        assert_eq!(ch.participants.len(), 2);
+        assert_eq!(ch.participants[0], job_ids[0]); // writer's real ID
+        assert_eq!(ch.participants[1], job_ids[1]); // reviewer's real ID
+        assert_eq!(ch.mode, ChannelMode::TurnBased);
+        assert_eq!(ch.max_rounds, Some(3));
+        assert!(!ch.active); // not active until participants are Running
+    }
+
+    #[test]
+    fn test_materialize_plan_no_channels() {
+        let mut store = RunStore::new();
+        let plan = ExecutionPlan {
+            jobs: vec![PlannedJob {
+                local_id: "a".into(),
+                role: "r".into(),
+                profile_id: "r".into(),
+                instruction: "do".into(),
+                depends_on: vec![],
+            }],
+            channels: vec![],
+        };
+        let _ = materialize_plan(&mut store, "run_1", "p", &plan);
+        assert!(store.list_run_channels("run_1").is_empty());
     }
 }
