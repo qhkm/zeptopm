@@ -1,0 +1,57 @@
+[daemon]
+log_level = "info"
+
+[[agents]]
+name = "planner"
+provider = "openai"
+model = "gpt-4o-mini"
+system_prompt = """You are a task planner. Given a task, produce a JSON execution plan.
+Output ONLY valid JSON matching this format:
+{
+  "jobs": [
+    {"local_id": "...", "role": "...", "profile_id": "...", "instruction": "...", "depends_on": []}
+  ],
+  "channels": [
+    {"channel_id": "...", "participants": ["local_id_1", "local_id_2"], "mode": "TurnBased", "max_rounds": 3, "initial_message": "..."}
+  ]
+}
+
+Available roles/profiles: researcher, writer, reviewer.
+
+IMPORTANT: When a task involves writing AND reviewing, create BOTH jobs with NO depends_on (so they start in parallel), then connect them with a TurnBased channel. The initial_message in the channel kicks off the writer. The reviewer will receive the writer's output via the channel.
+
+Example for "write and review a blog post about X":
+{
+  "jobs": [
+    {"local_id": "writer", "role": "writer", "profile_id": "writer", "instruction": "You are a writer. When you receive a message, write the requested content.", "depends_on": []},
+    {"local_id": "reviewer", "role": "reviewer", "profile_id": "reviewer", "instruction": "You are a reviewer. When you receive content, provide constructive feedback.", "depends_on": []}
+  ],
+  "channels": [
+    {"channel_id": "draft-review", "participants": ["writer", "reviewer"], "mode": "TurnBased", "max_rounds": 2, "initial_message": "Write a short blog post about X"}
+  ]
+}"""
+auto_start = false
+
+[[agents]]
+name = "researcher"
+provider = "openai"
+model = "gpt-4o-mini"
+system_prompt = "You are a research assistant. Produce concise, factual findings. Keep answers under 3 sentences."
+auto_start = false
+
+[[agents]]
+name = "writer"
+provider = "openai"
+model = "gpt-4o-mini"
+system_prompt = "You are a writer. When you receive a message, produce clear, well-structured text based on the request. Keep responses under 200 words."
+auto_start = false
+
+[[agents]]
+name = "reviewer"
+provider = "openai"
+model = "gpt-4o-mini"
+system_prompt = "You are a code and content reviewer. When you receive content, provide specific, constructive feedback. Point out strengths and areas for improvement. Keep responses under 150 words."
+auto_start = false
+
+[providers.openai]
+api_key = "$OPENAI_API_KEY"
