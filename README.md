@@ -1,62 +1,90 @@
-# ZeptoPM
+<div align="center">
+
+# ⚡ ZeptoPM
 
 **Process Manager for AI agents — like PM2, but for LLMs.**
 
-> *Zepto* (10⁻²¹) = absurdly small footprint. *PM* = Process Manager.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.85+-orange.svg)](https://www.rust-lang.org/)
+[![macOS](https://img.shields.io/badge/macOS-supported-brightgreen.svg)]()
+[![Linux](https://img.shields.io/badge/Linux-supported-brightgreen.svg)]()
 
-ZeptoPM is a lightweight daemon that manages AI agent processes. Define agents in a TOML config file, and ZeptoPM handles process lifecycle, automatic restarts, session persistence, and inter-agent communication. Each agent runs as an isolated OS process (~4 MB RSS), communicating with the daemon over JSON lines on stdio.
+**`~4 MB per agent`** · **`11 MB binary`** · **`near-zero idle CPU`** · **`1000+ agents on 4 GB RAM`**
 
-Beyond single-agent management, ZeptoPM orchestrates multi-agent workflows. A planner decomposes complex tasks into parallel jobs with dependency graphs. Pipelines chain agents sequentially. Real-time channels let agents collaborate through turn-based dialogue or broadcast streams — all routed transparently so agents never need to know about each other.
+[Quick Start](#-quick-start) · [Features](#-features) · [Channels](#-agent-channels) · [HTTP API](#-http-api) · [Config](#-config-reference)
 
-## The Story
+</div>
 
-We built [ZeptoClaw](https://github.com/qhkm/zeptoclaw) — an AI agent library in Rust with tool use, multi-provider support, and session management. A single ZeptoClaw agent can spawn multiple sub-agents, delegate tasks, even run agents in parallel. It works great — but everything runs in one process. One agent leaks memory, the whole thing goes down. One agent panics, every agent dies with it.
+---
 
-Then OpenAI launched [Symphony](https://github.com/openai/symphony), built on the Erlang BEAM VM. The idea clicked: Erlang has been solving this exact problem for decades — thousands of isolated processes, each with its own memory, supervised by a parent that restarts them on failure. Telecom systems run for years without downtime using this model.
+## 📖 The Story
 
-So we took that idea and applied it to AI agents. ZeptoPM spawns each ZeptoClaw agent as a separate OS process — isolated memory, isolated state, independent crash domains. A daemon supervisor watches them all. If one agent crashes, the supervisor restarts just that agent. The others keep running, unaware anything happened. Message passing between agents goes through the daemon over JSON lines, never shared memory — just like Erlang's actor model.
+We built [ZeptoClaw](https://github.com/qhkm/zeptoclaw) — an AI agent library in Rust with tool use, multi-provider support, and session management. A single ZeptoClaw agent can spawn sub-agents, delegate tasks, even run agents in parallel. It works great — but everything runs in one process. One agent leaks memory, the whole thing goes down. One agent panics, every agent dies with it.
 
-The result: the flexibility of ZeptoClaw's agent library with the reliability of Erlang-style process supervision. A single 11 MB binary. ~4 MB per agent. Define your agents in TOML, start the daemon, and get process isolation, automatic restarts, session persistence, orchestrated runs, and real-time agent channels out of the box.
+Then OpenAI launched [Symphony](https://github.com/openai/symphony) — built on Elixir and the BEAM VM. Their insight: turn work into **isolated, autonomous runs** where agents operate independently. The BEAM has been doing this for decades in telecom — thousands of isolated processes, each with its own memory, supervised by a parent that restarts them on failure.
 
-## Why ZeptoPM?
+That was the spark. We applied the same model to AI agents:
 
-| | LangChain / CrewAI | Temporal | PM2 / systemd | **ZeptoPM** |
-|---|---|---|---|---|
-| Process isolation | Shared process | Per-worker | Per-process | **Per-process** |
-| Session persistence | Plugin / none | Durable state | None | **Built-in** |
-| Agent communication | In-memory | Queue-based | None | **Channels, pipelines** |
-| LLM budget limits | None | None | None | **Per-agent** |
-| Config-driven agents | Code-only | Code + YAML | Service files | **Single TOML** |
-| Memory per agent | ~100 MB+ | ~500 MB+ | ~4 MB | **~4 MB** |
-| Binary size | N/A (library) | Cluster | N/A (system) | **11 MB** |
+> 🔸 Each ZeptoClaw agent runs as a **separate OS process** — isolated memory, isolated state, independent crash domains.
+>
+> 🔸 A **daemon supervisor** watches them all. If one crashes, only that agent restarts. Others keep running.
+>
+> 🔸 **Message passing** between agents goes through the daemon over JSON lines — never shared memory — just like the BEAM's actor model.
 
-## Features
+Symphony manages work at a high level. ZeptoPM manages the agents doing the work — process lifecycle, communication, and coordination. Same philosophy, different layer.
 
-- **Config-driven** — define agents in TOML, no code required
-- **Process isolation** — each agent runs as a separate OS process (~4 MB each)
-- **Session persistence** — agents remember conversations across restarts
-- **Automatic restart** with exponential backoff
-- **Hot config reload** — add/remove agents without restarting the daemon
-- **Per-agent budget limits** (tokens, USD)
-- **Multi-provider support** — OpenAI, Anthropic, OpenRouter, Groq, Together, or any OpenAI-compatible API
-- **Orchestrated runs** — submit complex tasks, planner decomposes into parallel jobs with dependency graphs
-- **[Agent channels](#agent-channels)** — real-time TurnBased or Stream communication between running agents
-- **[Pipelines](#pipeline)** — chain agents sequentially (output of one feeds into the next)
-- **[Orchestrate](#orchestrate)** — manager agent delegates work to other agents via `@agent` mentions
-- **Gateway mode** — protect the HTTP API with API key auth and rate limiting
-- **Capsule sandbox** — optional process isolation via [ZeptoKernel](https://github.com/qhkm/zeptokernel) (macOS/Linux)
-- **REST API** on port 9876 for programmatic control
-- **`$ENV_VAR` expansion** for API keys in config
+---
 
-## Requirements
+## ✨ Features
+
+<table>
+<tr>
+<td width="50%">
+
+🔧 **Config-driven** — define agents in TOML, no code required
+
+🔒 **Process isolation** — separate OS process per agent (~4 MB)
+
+💾 **Session persistence** — agents remember conversations across restarts
+
+🔄 **Automatic restart** with exponential backoff
+
+🔥 **Hot config reload** — add/remove agents without restarting
+
+💰 **Per-agent budget limits** (tokens, USD)
+
+</td>
+<td width="50%">
+
+🌐 **Multi-provider** — OpenAI, Anthropic, OpenRouter, Groq, Together
+
+🎯 **[Orchestrated runs](#-agent-channels)** — planner decomposes into parallel jobs with DAG
+
+💬 **[Agent channels](#-agent-channels)** — real-time TurnBased or Stream communication
+
+🔗 **[Pipelines](#-pipeline)** — chain agents sequentially
+
+🤖 **[Orchestrate](#-orchestrate)** — manager delegates via `@agent` mentions
+
+🛡️ **Gateway mode** — API key auth + rate limiting
+
+</td>
+</tr>
+</table>
+
+---
+
+## 📋 Requirements
 
 - **Rust 1.85+** (`rustup update stable`) — uses edition 2024
 - **macOS or Linux** (Windows: untested)
-- An API key for at least one [supported LLM provider](#supported-providers)
+- An API key for at least one [supported LLM provider](#-supported-providers)
 
-## Install
+---
 
-ZeptoPM is not yet on crates.io (local dependencies on `zeptoclaw` and `zeptokernel`). Build from source:
+## 📦 Install
+
+> ZeptoPM is not yet on crates.io. Build from source:
 
 ```bash
 # Clone the repo and sibling dependencies
@@ -71,15 +99,18 @@ cargo build --release --no-default-features
 # Or with capsule isolation (macOS/Linux)
 cargo build --release
 
-# The binary is at target/release/zeptopm
+# Install
 cp target/release/zeptopm /usr/local/bin/
 ```
 
-## Quick Start
+---
 
-```bash
-# 1. Create a config file
-cat > zeptopm.toml <<'EOF'
+## 🚀 Quick Start
+
+**1. Create a config file:**
+
+```toml
+# zeptopm.toml
 [providers.openai]
 api_key = "$OPENAI_API_KEY"
 
@@ -89,82 +120,75 @@ provider = "openai"
 model = "gpt-4o-mini"
 system_prompt = "You are a research assistant."
 auto_start = true
-EOF
+```
 
-# 2. Set your API key
+**2. Set your API key and start the daemon:**
+
+```bash
 export OPENAI_API_KEY="sk-..."
-
-# 3. Start the daemon
 zeptopm daemon
 ```
 
-In another terminal:
+**3. In another terminal — talk to your agent:**
 
 ```bash
-# Check status
-zeptopm status
-
-# Chat with an agent
-zeptopm chat researcher "What is quantum computing?"
-
-# View agent logs
-zeptopm logs researcher
-
-# Restart / stop / start an agent
-zeptopm restart researcher
-zeptopm stop researcher
-zeptopm start researcher
+zeptopm status                                        # check agent status
+zeptopm chat researcher "What is quantum computing?"  # chat with agent
+zeptopm logs researcher                               # view logs
+zeptopm restart researcher                            # restart agent
 ```
 
-## Pipeline
+---
+
+## 🔗 Pipeline
 
 Chain agents sequentially — the output of each agent becomes the input to the next.
-
-Agents must be defined in your config file. The pipeline passes each agent's response as the message to the next agent in the chain.
 
 ```bash
 # researcher finds info → writer turns it into a blog post
 zeptopm pipeline "researcher,writer" "Find key facts about WebAssembly and write a blog post"
 ```
 
-**Output:** The final agent's response is printed to stdout. Use `--json` for machine-readable output.
+Agents must be defined in your config. Output: final agent's response to stdout. Use `--json` for machine-readable output.
 
-## Orchestrate
+---
 
-A manager agent coordinates other agents using `@agent` mentions in its responses. The manager sees all other running agents as tools it can delegate to.
+## 🤖 Orchestrate
+
+A manager agent coordinates other agents using `@agent` mentions in its responses.
 
 ```bash
 # manager delegates research and writing to other agents
 zeptopm orchestrate manager "Research Rust async patterns, then write a summary"
 ```
 
-The manager's system prompt should mention it can delegate with `@researcher`, `@writer`, etc. ZeptoPM intercepts these mentions and routes messages to the target agents.
+The manager sees all running agents as tools. Its system prompt should mention it can delegate with `@researcher`, `@writer`, etc. ZeptoPM intercepts these mentions and routes messages to the target agents.
 
-## Agent Channels
+---
 
-Channels enable real-time communication between running agents. The orchestrator routes messages — agents themselves are unaware of channels and just see regular chat messages.
+## 💬 Agent Channels
+
+Channels enable **real-time communication** between running agents. The orchestrator routes messages — agents themselves are unaware of channels and just see regular chat messages.
 
 ### Channel Modes
 
 | Mode | Behavior |
-|------|----------|
-| **TurnBased** | Alternating speakers: A → B → A → B. Stops at `max_rounds`. |
-| **Stream** | Broadcast: sender's message goes to all other participants. |
+|:-----|:---------|
+| 🔄 **TurnBased** | Alternating speakers: A → B → A → B. Stops at `max_rounds`. |
+| 📡 **Stream** | Broadcast: sender's message goes to all other participants. |
 
 ### Peer Failure Policies
 
 | Policy | Behavior |
-|--------|----------|
-| **KillAll** (default) | If one participant dies, kill all others. |
-| **Continue** | Survivors get a "peer disconnected" message and keep going. |
+|:-------|:---------|
+| 💀 **KillAll** (default) | If one participant dies, kill all others. |
+| ✅ **Continue** | Survivors get a "peer disconnected" message and keep going. |
 
 ### Example: Writer + Reviewer with Live Feedback
 
-Two agents collaborate through a TurnBased channel — the writer drafts content, the reviewer gives feedback, the writer revises, and the reviewer approves.
+Two agents collaborate through a TurnBased channel — the writer drafts, the reviewer gives feedback, the writer revises, and the reviewer approves.
 
-A complete working config is included at [`channels-example.toml`](channels-example.toml). The key idea: the planner agent outputs a JSON execution plan that includes a `channels` array connecting agents.
-
-**Run it:**
+> 📄 Full working config: [`channels-example.toml`](channels-example.toml)
 
 ```bash
 export OPENAI_API_KEY="sk-..."
@@ -172,11 +196,10 @@ export OPENAI_API_KEY="sk-..."
 # Start the daemon
 zeptopm daemon --config channels-example.toml --no-sandbox
 
-# In another terminal — submit a task
+# Submit a task (in another terminal)
 curl -X POST http://127.0.0.1:9876/runs \
   -H "Content-Type: application/json" \
   -d '{"task": "write and review a short blog post about Rust async patterns"}'
-# → {"run_id":"run_..."}
 
 # Check progress
 curl http://127.0.0.1:9876/runs/<run_id>
@@ -185,7 +208,8 @@ curl http://127.0.0.1:9876/runs/<run_id>
 curl http://127.0.0.1:9876/runs/<run_id>/result
 ```
 
-**What happens:**
+<details>
+<summary><b>🔍 What happens under the hood</b></summary>
 
 ```
 1. Planner creates execution plan:
@@ -205,94 +229,109 @@ curl http://127.0.0.1:9876/runs/<run_id>/result
    Artifacts contain the full channel conversation history.
 ```
 
-## Process Isolation
+</details>
 
-Each agent runs as a **separate OS process**. Memory, conversation history, and session storage are fully isolated between agents — one agent crashing or leaking memory cannot affect another.
+---
+
+## 🔒 Process Isolation
+
+Each agent runs as a **separate OS process**. One agent crashing or leaking memory cannot affect another.
 
 | Resource | Isolation |
-|----------|-----------|
-| **Memory** | Separate address space per process |
-| **Conversation history** | Independent per agent |
-| **Session file** | `~/.zeptopm/sessions/{agent_name}.json` — one file per agent |
-| **LLM provider state** | Each worker creates its own HTTP client and auth context |
-| **Crash blast radius** | Worker crash is caught by supervisor, other agents unaffected |
+|:---------|:----------|
+| 🧠 **Memory** | Separate address space per process |
+| 💬 **Conversation history** | Independent per agent |
+| 💾 **Session file** | `~/.zeptopm/sessions/{agent_name}.json` |
+| 🌐 **LLM provider state** | Own HTTP client and auth context per worker |
+| 💥 **Crash blast radius** | Supervisor catches crash, other agents unaffected |
 
-The daemon supervisor communicates with each worker over JSON lines on stdin/stdout. Workers never share state directly.
+### 🛡️ Capsule Sandbox (optional)
 
-### Capsule Sandbox (optional)
+With `--sandbox` or `isolation = "capsule"` in config, orchestrated jobs run inside [ZeptoKernel](https://github.com/qhkm/zeptokernel) capsules with enforced memory limits, process count limits, filesystem isolation, and network restrictions.
 
-With `--sandbox` or `isolation = "capsule"` in config, orchestrated jobs run inside [ZeptoKernel](https://github.com/qhkm/zeptokernel) capsules with enforced memory limits, process count limits, filesystem isolation, and network restrictions. Requires building with the `capsule` feature (default).
+---
 
-## Resource Usage
+## 📊 Resource Usage
 
 **Measured on macOS (Apple Silicon), release build:**
 
 | Component | RSS (idle) |
-|-----------|-----------|
-| Daemon (supervisor) | ~4 MB |
-| Each worker process | ~4 MB |
-| Release binary | ~11 MB |
+|:----------|:----------|
+| Daemon (supervisor) | **~4 MB** |
+| Each worker process | **~4 MB** |
+| Release binary | **~11 MB** |
 
-### Capacity Estimates
+<details>
+<summary><b>📈 Capacity estimates</b></summary>
 
-| Machine RAM | Agents (theoretical max) | Agents (comfortable) |
-|-------------|--------------------------|----------------------|
+| Machine RAM | Agents (max) | Agents (comfortable) |
+|:------------|:-------------|:---------------------|
 | 512 MB | ~120 | 50–80 |
 | 1 GB | ~250 | 100–150 |
 | 4 GB | ~1,000 | 500–800 |
 | 8 GB | ~2,000 | 1,000+ |
 
-**Notes:**
-- CPU usage is near-zero while idle — workers block on stdin waiting for commands.
-- Memory grows with conversation history. With `max_history = 200` and typical messages (~200 bytes each), each agent adds ~40 KB on top of the base ~4 MB.
-- The real constraint for most deployments is **LLM API rate limits and cost**, not local resources. A $5/month VPS can comfortably run dozens of agents.
+- CPU is near-zero while idle — workers block on stdin.
+- Memory grows with conversation history (~40 KB per agent with `max_history = 200`).
+- The real constraint is **LLM API rate limits and cost**, not local resources.
+- A **$5/month VPS** can comfortably run dozens of agents.
 
-## CLI Reference
+</details>
+
+---
+
+## 🖥️ CLI Reference
 
 | Command | Description |
-|---------|-------------|
+|:--------|:------------|
 | `zeptopm daemon` | Start the daemon — runs all `auto_start` agents |
-| `zeptopm status` | Show status of all running agents (queries daemon) |
-| `zeptopm list` | List configured agents (from config file, no daemon needed) |
-| `zeptopm chat <name> <msg>` | Send a message to an agent and get the response |
+| `zeptopm status` | Show status of all running agents |
+| `zeptopm list` | List configured agents (no daemon needed) |
+| `zeptopm chat <name> <msg>` | Send a message to an agent |
 | `zeptopm logs <name>` | Show recent logs for an agent |
 | `zeptopm stop <name>` | Stop a running agent |
-| `zeptopm start <name>` | Start an agent (must be defined in config) |
+| `zeptopm start <name>` | Start an agent |
 | `zeptopm restart <name>` | Restart an agent (stop + start) |
-| `zeptopm pipeline <agents> <msg>` | Chain agents — output of one feeds into the next |
-| `zeptopm orchestrate <manager> <msg>` | Manager agent delegates to other agents |
+| `zeptopm pipeline <agents> <msg>` | Chain agents sequentially |
+| `zeptopm orchestrate <manager> <msg>` | Manager delegates to other agents |
 | `zeptopm run submit <task>` | Submit an orchestrated multi-agent run |
-| `zeptopm run status <run_id>` | Show run progress (jobs, artifacts) |
-| `zeptopm run result <run_id>` | Print final artifact content for a completed run |
-| `zeptopm run cancel <run_id>` | Cancel a running run (stops all active jobs) |
+| `zeptopm run status <run_id>` | Show run progress |
+| `zeptopm run result <run_id>` | Print final artifacts |
+| `zeptopm run cancel <run_id>` | Cancel a running run |
 | `zeptopm run list` | List all runs |
-| `zeptopm agent-help` | Print CLI manifest as JSON (for AI agent integration) |
+| `zeptopm agent-help` | Print CLI manifest as JSON |
 
-### Global Flags
+<details>
+<summary><b>🚩 Flags</b></summary>
+
+**Global:**
 
 | Flag | Default | Description |
-|------|---------|-------------|
+|:-----|:--------|:------------|
 | `-c, --config` | `zeptopm.toml` | Config file path |
-| `-l, --log-level` | from config | Override log level (trace/debug/info/warn/error) |
+| `-l, --log-level` | from config | Override log level |
 | `--addr` | `127.0.0.1:9876` | Daemon HTTP address |
-| `--json` | off | Output results as JSON (machine-readable) |
-| `--agent-help` | off | Show command schema for AI agents (JSON) |
+| `--json` | off | Machine-readable JSON output |
 
-### Daemon Flags
+**Daemon:**
 
 | Flag | Description |
-|------|-------------|
-| `--sandbox` | Force capsule isolation for orchestrated jobs |
-| `--no-sandbox` | Disable capsule isolation — run jobs as plain child processes |
-| `-b, --bind` | Override server bind address |
+|:-----|:------------|
+| `--sandbox` | Force capsule isolation |
+| `--no-sandbox` | Disable capsule isolation |
+| `-b, --bind` | Override bind address |
 
-### Run Sub-command Flags
+**Run sub-commands:**
 
 | Flag | Applies to | Description |
-|------|-----------|-------------|
-| `-t, --tail` | `run submit`, `run status` | Stream run progress in real-time |
+|:-----|:-----------|:------------|
+| `-t, --tail` | `submit`, `status` | Stream progress in real-time |
 
-## Config Reference
+</details>
+
+---
+
+## ⚙️ Config Reference
 
 ### Basic
 
@@ -301,30 +340,30 @@ With `--sandbox` or `isolation = "capsule"` in config, orchestrated jobs run ins
 log_level = "info"                  # trace | debug | info | warn | error
 log_format = "pretty"               # pretty | compact | json
 bind = "127.0.0.1:9876"            # HTTP API bind address
-poll_interval_ms = 5000            # How often to check for config changes
-sessions_dir = "~/.zeptopm/sessions"  # Where session files are stored
+poll_interval_ms = 5000            # Config change polling interval
+sessions_dir = "~/.zeptopm/sessions"
 max_revisions = 3                   # Max revision rounds per job
 run_ttl_days = 7                    # Auto-delete old runs (0 = disabled)
 
 [[agents]]
 name = "researcher"                 # Unique agent name
-provider = "openai"                 # Provider name (must match [providers.*])
-model = "gpt-4o-mini"              # Model identifier
+provider = "openai"                 # Must match [providers.*]
+model = "gpt-4o-mini"
 system_prompt = "You are a research assistant."
-auto_start = true                   # Start automatically with daemon
-max_restarts = 5                    # Max auto-restarts on failure
+auto_start = true                   # Start with daemon
+max_restarts = 5                    # Max auto-restarts
 restart_backoff_ms = 1000           # Initial backoff (doubles each restart)
-max_iterations = 10                 # Max tool-calling iterations per message
-session_persist = true              # Save conversation history across restarts
-max_history = 200                   # Keep last N messages (omit for unlimited)
+max_iterations = 10                 # Max tool-calling iterations
+session_persist = true              # Save history across restarts
+max_history = 200                   # Keep last N messages
 
 [agents.budget]
-token_limit = 100000                # Max tokens per agent
-cost_limit_usd = 5.00               # Max cost per agent
+token_limit = 100000
+cost_limit_usd = 5.00
 
 [agents.gateway]
-enabled = true                      # Protect this agent's HTTP endpoint
-api_key = "$ZEPTOPM_GATEWAY_KEY"   # Required for /gw/{name}/chat
+enabled = true                      # Protect HTTP endpoint
+api_key = "$ZEPTOPM_GATEWAY_KEY"
 rate_limit = 100                    # Requests per minute
 
 [providers.openai]
@@ -338,7 +377,8 @@ api_key = "$OPENROUTER_API_KEY"
 base_url = "https://openrouter.ai/api/v1"
 ```
 
-### Advanced (capsule isolation)
+<details>
+<summary><b>🔧 Advanced (capsule isolation)</b></summary>
 
 These options apply when using ZeptoKernel capsule sandboxing:
 
@@ -351,13 +391,15 @@ security = "standard"               # dev | standard | hardened
 [[agents]]
 memory_mib = 512                    # Memory limit per capsule job (MiB)
 max_pids = 64                       # Max process count inside capsule
-timeout_sec = 300                   # Wall clock timeout for capsule jobs
+timeout_sec = 300                   # Wall clock timeout
 ```
 
-### Supported Providers
+</details>
+
+### 🌐 Supported Providers
 
 | Provider | Config name | Notes |
-|----------|-------------|-------|
+|:---------|:------------|:------|
 | OpenAI | `openai` | GPT models |
 | Anthropic | `anthropic` or `claude` | Direct Claude API |
 | OpenRouter | `openrouter` | Multi-model gateway |
@@ -365,12 +407,14 @@ timeout_sec = 300                   # Wall clock timeout for capsule jobs
 | Together | `together` | Open-source models |
 | Custom | any name | Set `base_url` for OpenAI-compatible endpoints |
 
-## HTTP API
+---
+
+## 🔌 HTTP API
 
 The daemon exposes a REST API (default `127.0.0.1:9876`):
 
 | Endpoint | Method | Description |
-|----------|--------|-------------|
+|:---------|:-------|:------------|
 | `/health` | GET | Health check |
 | `/status` | GET | All agents status |
 | `/metrics` | GET | Prometheus-style metrics |
@@ -381,14 +425,16 @@ The daemon exposes a REST API (default `127.0.0.1:9876`):
 | `/agents/{name}/start` | POST | Start agent |
 | `/agents/{name}/restart` | POST | Restart agent |
 | `/orchestrate/{name}` | POST | Orchestrate via manager agent |
-| `/gw/{name}/chat` | POST | Gateway-protected chat (requires API key) |
+| `/gw/{name}/chat` | POST | Gateway-protected chat |
 | `/runs` | POST | Submit orchestrated run |
 | `/runs` | GET | List all runs |
 | `/runs/{id}` | GET | Run status with job details |
-| `/runs/{id}/result` | GET | Final artifacts for a completed run |
+| `/runs/{id}/result` | GET | Final artifacts |
 | `/runs/{id}/cancel` | POST | Cancel a running run |
 
-## Architecture
+---
+
+## 🏗️ Architecture
 
 ```
 zeptopm.toml → Config Parser → Daemon (supervisor)
@@ -416,7 +462,9 @@ zeptopm.toml → Config Parser → Daemon (supervisor)
                     └──── daemon routes ────────┘
 ```
 
-## Contributing
+---
+
+## 🤝 Contributing
 
 ```bash
 # Run tests
@@ -428,6 +476,14 @@ cargo fmt -- --check
 cargo clippy
 ```
 
-## License
+---
+
+<div align="center">
+
+## 📄 License
 
 [MIT](LICENSE)
+
+Made with ❤️ and 🦀 by [Kitakod Ventures](https://github.com/qhkm)
+
+</div>
