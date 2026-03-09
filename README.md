@@ -1,20 +1,34 @@
 # ZeptoPM
 
-**Process manager for AI agents — like PM2, but for LLMs.**
+**Process Manager for AI agents — like PM2, but for LLMs.**
+
+> *Zepto* (10⁻²¹) = absurdly small footprint. *PM* = Process Manager.
 
 ZeptoPM is a lightweight daemon that manages AI agent processes. Define agents in a TOML config file, and ZeptoPM handles process lifecycle, automatic restarts, session persistence, and inter-agent communication. Each agent runs as an isolated OS process (~4 MB RSS), communicating with the daemon over JSON lines on stdio.
 
 Beyond single-agent management, ZeptoPM orchestrates multi-agent workflows. A planner decomposes complex tasks into parallel jobs with dependency graphs. Pipelines chain agents sequentially. Real-time channels let agents collaborate through turn-based dialogue or broadcast streams — all routed transparently so agents never need to know about each other.
 
+## The Story
+
+We built [ZeptoClaw](https://github.com/qhkm/zeptoclaw) — an AI agent library in Rust with tool use, multi-provider support, and session management. A single ZeptoClaw agent can spawn multiple sub-agents, delegate tasks, even run agents in parallel. It works great — but everything runs in one process. One agent leaks memory, the whole thing goes down. One agent panics, every agent dies with it.
+
+Then OpenAI launched [Symphony](https://github.com/openai/symphony), built on the Erlang BEAM VM. The idea clicked: Erlang has been solving this exact problem for decades — thousands of isolated processes, each with its own memory, supervised by a parent that restarts them on failure. Telecom systems run for years without downtime using this model.
+
+So we took that idea and applied it to AI agents. ZeptoPM spawns each ZeptoClaw agent as a separate OS process — isolated memory, isolated state, independent crash domains. A daemon supervisor watches them all. If one agent crashes, the supervisor restarts just that agent. The others keep running, unaware anything happened. Message passing between agents goes through the daemon over JSON lines, never shared memory — just like Erlang's actor model.
+
+The result: the flexibility of ZeptoClaw's agent library with the reliability of Erlang-style process supervision. A single 11 MB binary. ~4 MB per agent. Define your agents in TOML, start the daemon, and get process isolation, automatic restarts, session persistence, orchestrated runs, and real-time agent channels out of the box.
+
 ## Why ZeptoPM?
 
-| | PM2 / systemd | ZeptoPM |
-|---|---|---|
-| Agent config | Code + process config | Single TOML file |
-| Inter-agent communication | DIY (queues, APIs, glue code) | Built-in channels, pipelines, orchestration |
-| LLM-specific features | None | Budget limits, session persistence, orchestrated runs |
-| Multi-provider | Manual per-agent | OpenAI, Anthropic, OpenRouter, Groq, Together — one config |
-| Process isolation | Shared environment | Per-agent OS process, optional capsule sandbox |
+| | LangChain / CrewAI | Temporal | PM2 / systemd | **ZeptoPM** |
+|---|---|---|---|---|
+| Process isolation | Shared process | Per-worker | Per-process | **Per-process** |
+| Session persistence | Plugin / none | Durable state | None | **Built-in** |
+| Agent communication | In-memory | Queue-based | None | **Channels, pipelines** |
+| LLM budget limits | None | None | None | **Per-agent** |
+| Config-driven agents | Code-only | Code + YAML | Service files | **Single TOML** |
+| Memory per agent | ~100 MB+ | ~500 MB+ | ~4 MB | **~4 MB** |
+| Binary size | N/A (library) | Cluster | N/A (system) | **11 MB** |
 
 ## Features
 
