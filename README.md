@@ -4,7 +4,7 @@
 
 **Process Manager for AI agents — like PM2, but for LLMs.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.85+-orange.svg)](https://www.rust-lang.org/)
 [![macOS](https://img.shields.io/badge/macOS-supported-brightgreen.svg)]()
 [![Linux](https://img.shields.io/badge/Linux-supported-brightgreen.svg)]()
@@ -482,7 +482,7 @@ cargo clippy
 
 ## 📄 License
 
-[MIT](LICENSE)
+[Apache 2.0](LICENSE)
 
 Made with ❤️ and 🦀 by [Kitakod Ventures](https://github.com/qhkm)
 
