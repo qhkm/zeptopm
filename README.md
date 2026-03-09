@@ -464,6 +464,21 @@ zeptopm.toml → Config Parser → Daemon (supervisor)
 
 ---
 
+## 🗺️ Roadmap
+
+| Feature | Status |
+|:--------|:-------|
+| Interactive REPL (`zeptopm repl researcher`) | 🔜 Next |
+| Tool use in orchestrated runs | 🔜 Planned |
+| Human-in-the-loop pause/resume | 🔜 Planned |
+| Conversation checkpointing (resume from last tool call) | 🔜 Planned |
+| Web dashboard / observability UI | 🔜 Planned |
+| Stream mode channels with 3+ participants | 🔜 Planned |
+| Publish to crates.io | ⏳ Blocked (path deps) |
+| End-to-end integration test suite | 🔜 Planned |
+
+---
+
 ## 🤝 Contributing
 
 ```bash
