@@ -18,9 +18,9 @@ jobs:
         with:
           submodules: false
 
-      # ZeptoKernel is a sibling repo — clone it for path deps
-      - name: Clone ZeptoKernel
-        run: git clone --depth 1 https://github.com/qhkm/zeptokernel.git ../zeptokernel
+      # ZeptoCapsule is a sibling repo — clone it for path deps
+      - name: Clone ZeptoCapsule
+        run: git clone --depth 1 https://github.com/qhkm/zeptocapsule.git ../zeptocapsule
 
       # ZeptoClaw is a sibling repo — clone it for path deps
       - name: Clone ZeptoClaw

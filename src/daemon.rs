@@ -87,7 +87,7 @@ macro_rules! handle_channel_peer_failures {
 /// Run the daemon. This is the main entry point.
 ///
 /// CLI sandbox flags override `daemon.isolation`; otherwise config decides whether
-/// orchestrated jobs run inside ZeptoKernel capsules or as plain child processes.
+/// orchestrated jobs run inside ZeptoCapsule capsules or as plain child processes.
 pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Option<bool>) {
     let config = match config::load_config(&config_path) {
         Ok(c) => c,
@@ -1200,7 +1200,7 @@ async fn complete_closed_channel_participants(
 
 /// Spawn a temporary worker process for an orchestration job.
 ///
-/// When sandboxing is active, uses ZeptoKernel capsule isolation.
+/// When sandboxing is active, uses ZeptoCapsule capsule isolation.
 /// Otherwise spawns a bare child process.
 async fn spawn_job_worker(
     job: &crate::orchestrator::types::Job,
@@ -1213,7 +1213,7 @@ async fn spawn_job_worker(
     orchestrator_store: &crate::orchestrator::store::RunStore,
     _sandbox_override: Option<bool>,
 ) {
-    // Sandbox mode — delegate to ZeptoKernel capsule
+    // Sandbox mode — delegate to ZeptoCapsule capsule
     #[cfg(feature = "capsule")]
     if sandbox_requested(config, _sandbox_override) {
         let (handle, join) =

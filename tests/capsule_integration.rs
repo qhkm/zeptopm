@@ -1,6 +1,6 @@
-//! Integration tests for the ZeptoKernel capsule integration.
+//! Integration tests for the ZeptoCapsule capsule integration.
 //!
-//! Tests the full path: spawn_capsule_job → ZeptoKernel capsule → worker → events.
+//! Tests the full path: spawn_capsule_job → ZeptoCapsule capsule → worker → events.
 //!
 //! Run with: cargo test --features capsule --test capsule_integration
 #![cfg(feature = "capsule")]
@@ -93,7 +93,7 @@ fn test_capsule_spec_from_config_integration() {
     let job = test_job("spec-test");
     let spec = capsule_spec_from_config(&config, &job);
 
-    assert_eq!(spec.isolation, zeptokernel::Isolation::Process);
+    assert_eq!(spec.isolation, zeptocapsule::Isolation::Process);
     assert_eq!(spec.limits.timeout_sec, 30);
     assert!(spec.limits.memory_mib.is_none());
     assert_eq!(spec.workspace.host_path, Some(job.workspace_dir.clone()));

@@ -90,7 +90,7 @@ Symphony manages work at a high level. ZeptoPM manages the agents doing the work
 # Clone the repo and sibling dependencies
 git clone https://github.com/qhkm/zeptopm.git
 git clone https://github.com/qhkm/zeptoclaw.git
-git clone https://github.com/qhkm/zeptokernel.git
+git clone https://github.com/qhkm/zeptocapsule.git
 
 # Build (without capsule isolation — works on any OS)
 cd zeptopm
@@ -247,7 +247,7 @@ Each agent runs as a **separate OS process**. One agent crashing or leaking memo
 
 ### 🛡️ Capsule Sandbox (optional)
 
-With `--sandbox` or `isolation = "capsule"` in config, orchestrated jobs run inside [ZeptoKernel](https://github.com/qhkm/zeptokernel) capsules with enforced memory limits, process count limits, filesystem isolation, and network restrictions.
+With `--sandbox` or `isolation = "capsule"` in config, orchestrated jobs run inside [ZeptoCapsule](https://github.com/qhkm/zeptocapsule) capsules with enforced memory limits, process count limits, filesystem isolation, and network restrictions.
 
 ---
 
@@ -380,7 +380,7 @@ base_url = "https://openrouter.ai/api/v1"
 <details>
 <summary><b>🔧 Advanced (capsule isolation)</b></summary>
 
-These options apply when using ZeptoKernel capsule sandboxing:
+These options apply when using ZeptoCapsule capsule sandboxing:
 
 ```toml
 [daemon]

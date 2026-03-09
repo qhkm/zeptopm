@@ -15,7 +15,7 @@ Standalone Rust binary (~11 MB). No external dependencies on zeptoRT or erlangrt
 - `agent.rs` — Process spawn, worker bridge, JSON-line IPC (3 tests)
 - `worker.rs` — Worker process, session persistence, ZeptoAgent integration, job_execute handler
 - `daemon.rs` — Supervisor loop, config reload, orchestrator integration
-- `capsule.rs` — ZeptoKernel integration: Job→JobSpec mapping, capsule job runner (4 tests)
+- `capsule.rs` — ZeptoCapsule integration: Job→JobSpec mapping, capsule job runner (4 tests)
 - `server.rs` — Axum HTTP API, run endpoints, gateway auth, rate limiting, metrics
 - `status.rs` — Status display formatting (2 tests)
 - `main.rs` — CLI entry point (clap)
@@ -64,7 +64,7 @@ See `zeptopm.toml` for the full example. Key sections:
 
 ## Relationship to Other Projects
 
-- **ZeptoKernel** (~/ios/zeptokernel) — Secure per-worker execution capsule. Integrated: `isolation = "capsule"` in config routes jobs through ZeptoKernel's ProcessBackend + Supervisor.
+- **ZeptoCapsule** (~/ios/zeptocapsule) — Secure per-worker execution capsule. Integrated: `isolation = "capsule"` in config routes jobs through ZeptoCapsule's ProcessBackend + Supervisor.
 - **ZeptoClaw** — AI worker binary. The actual task executor inside capsules.
 - **zeptoRT** (~/ios/zeptoclaw-rt) — Enterprise durable runtime (Erlang-inspired). Separate from zeptoPM.
 

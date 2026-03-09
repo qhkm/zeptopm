@@ -30,11 +30,11 @@ pub struct DaemonConfig {
     pub sessions_dir: Option<String>,
     #[serde(default = "default_max_revisions")]
     pub max_revisions: u32,
-    /// Isolation backend: "none" (default, bare child process) or "capsule" (ZeptoKernel).
+    /// Isolation backend: "none" (default, bare child process) or "capsule" (ZeptoCapsule).
     #[serde(default = "default_isolation")]
     pub isolation: String,
     /// Optional path to the zk-init binary used for namespace capsules.
-    /// When omitted, ZeptoKernel resolves a default sibling `zk-init` path.
+    /// When omitted, ZeptoCapsule resolves a default sibling `zk-init` path.
     #[serde(default)]
     pub worker_binary: Option<String>,
     /// Path to the ZeptoClaw worker binary spawned inside the capsule.

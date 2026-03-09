@@ -22,7 +22,7 @@ These are fundamentally different operating regimes.
 
 | Erlang Pattern | zeptoPM Implementation |
 |---|---|
-| Process isolation | Capsule sandbox (zeptokernel) — memory, filesystem, network isolated |
+| Process isolation | Capsule sandbox (zeptocapsule) — memory, filesystem, network isolated |
 | Message passing | JSON Lines IPC + Channel Router — no shared memory, copy semantics |
 | one_for_all | `PeerFailure::KillAll` — if one channel participant dies, kill all |
 | Continue (graceful) | `PeerFailure::Continue` — survivors get "peer disconnected", keep going |

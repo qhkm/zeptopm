@@ -1,6 +1,6 @@
-# Optional Sandbox (ZeptoKernel) Design
+# Optional Sandbox (ZeptoCapsule) Design
 
-**Goal:** Make zeptokernel an optional dependency in zeptoPM so it works without isolation support, with clean DX and agent experience.
+**Goal:** Make zeptocapsule an optional dependency in zeptoPM so it works without isolation support, with clean DX and agent experience.
 
 **Approach:** Cargo feature flag `capsule` (default-enabled) + CLI `--sandbox`/`--no-sandbox` flags that override TOML config.
 
@@ -10,11 +10,11 @@
 # Cargo.toml
 [features]
 default = ["capsule"]
-capsule = ["dep:zeptokernel"]
+capsule = ["dep:zeptocapsule"]
 ```
 
 - `cargo build` — includes capsule support (same as today)
-- `cargo build --no-default-features` — no zeptokernel dependency
+- `cargo build --no-default-features` — no zeptocapsule dependency
 
 ## CLI Flags
 
@@ -41,7 +41,7 @@ When capsule isolation is requested but unavailable:
    - Jobs run without sandbox via plain agent spawning
 
 2. **Feature compiled in but host doesn't support it** (e.g., namespace on macOS):
-   - ZeptoKernel returns `NotSupported`
+   - ZeptoCapsule returns `NotSupported`
    - Job event: `job_failed` with `retryable: true`
    - (Existing behavior, unchanged)
 

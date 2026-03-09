@@ -1,11 +1,11 @@
-//! ZeptoKernel capsule integration — runs orchestration jobs inside isolated capsules.
+//! ZeptoCapsule capsule integration — runs orchestration jobs inside isolated capsules.
 //!
 //! When `isolation` is `"capsule"`, `"process"`, or `"namespace"` in config,
-//! jobs are executed inside a ZeptoKernel capsule. ZeptoPM talks to ZeptoClaw
+//! jobs are executed inside a ZeptoCapsule capsule. ZeptoPM talks to ZeptoClaw
 //! directly through the capsule's stdin/stdout pipes — same IPC protocol as
 //! isolation="none" mode, just wrapped in a sandbox.
 //!
-//! ZeptoKernel owns mechanisms (isolation, resource enforcement).
+//! ZeptoCapsule owns mechanisms (isolation, resource enforcement).
 //! ZeptoPM owns meaning (job lifecycle, supervision, events).
 
 use std::collections::HashMap;
@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use zeptokernel::{
+use zeptocapsule::{
     CapsuleReport, CapsuleSpec, Isolation, ResourceLimits, ResourceViolation, SecurityOverrides,
     SecurityProfile, Signal, WorkspaceConfig,
 };
@@ -107,11 +107,11 @@ pub fn build_worker_env(config: &crate::config::Config) -> HashMap<String, Strin
     env
 }
 
-/// Spawn an orchestration job inside a ZeptoKernel capsule.
+/// Spawn an orchestration job inside a ZeptoCapsule capsule.
 ///
 /// Creates a capsule, spawns ZeptoClaw inside it, then drives the worker IPC
 /// directly through the capsule's stdin/stdout pipes. Same JSON-line protocol
-/// as isolation="none" mode — ZeptoPM interprets events, ZeptoKernel just
+/// as isolation="none" mode — ZeptoPM interprets events, ZeptoCapsule just
 /// provides the sandbox.
 pub fn spawn_capsule_job(
     job: &Job,
@@ -150,7 +150,7 @@ pub fn spawn_capsule_job(
         })
         .collect();
 
-    info!(job_id = %job_id, "spawning capsule job via ZeptoKernel");
+    info!(job_id = %job_id, "spawning capsule job via ZeptoCapsule");
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<AgentCommand>(8);
     let handle = AgentHandle {
@@ -160,7 +160,7 @@ pub fn spawn_capsule_job(
 
     let join = tokio::spawn(async move {
         // Create capsule
-        let mut capsule = match zeptokernel::create(spec) {
+        let mut capsule = match zeptocapsule::create(spec) {
             Ok(c) => c,
             Err(e) => {
                 warn!(job_id = %job_id, error = %e, "failed to create capsule");
@@ -245,7 +245,7 @@ pub fn spawn_capsule_job(
         };
 
         // Drive IPC directly through pipes — same protocol as isolation="none"
-        // ZeptoPM interprets events. ZeptoKernel just provides the sandbox.
+        // ZeptoPM interprets events. ZeptoCapsule just provides the sandbox.
         let mut reader = BufReader::new(child.stdout).lines();
         let _stdin = child.stdin; // kept alive so worker doesn't get broken pipe
         let mut saw_terminal_event = false;
@@ -627,7 +627,7 @@ mod tests {
         let mut config = make_test_config("namespace");
         config.daemon.security = Some("hardened".into());
         let spec = capsule_spec_from_config(&config, &job);
-        assert_eq!(spec.security, zeptokernel::SecurityProfile::Hardened);
+        assert_eq!(spec.security, zeptocapsule::SecurityProfile::Hardened);
     }
 
     #[test]
@@ -635,6 +635,6 @@ mod tests {
         let job = make_test_job();
         let config = make_test_config("process");
         let spec = capsule_spec_from_config(&config, &job);
-        assert_eq!(spec.security, zeptokernel::SecurityProfile::Standard);
+        assert_eq!(spec.security, zeptocapsule::SecurityProfile::Standard);
     }
 }

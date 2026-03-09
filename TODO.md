@@ -8,7 +8,7 @@
 
 **Repo:** `/Users/dr.noranizaahmad/ios/zeptoPM/`
 
-**Stack position:** ZeptoPM (this) → ZeptoKernel (isolation) → ZeptoClaw (worker)
+**Stack position:** ZeptoPM (this) → ZeptoCapsule (isolation) → ZeptoClaw (worker)
 
 **Current state:** Core PM shipped. Orchestration Phases 1–7 done. All infrastructure tasks done. Agent-native CLI done. 81 tests passing. Zero warnings.
 
@@ -35,7 +35,7 @@
 | Orch Phase 4: Heartbeat | ✅ Done | Progress tracking, stuck job detection (4 tests) |
 | Orch Phase 5: Review loop | ✅ Done | Review parsing, revision re-queueing (11 tests) |
 | SQLite persistence | ✅ Done | WAL-mode SQLite, hydration on restart (8 tests) |
-| ZeptoKernel integration | ✅ Done | Library integration, capsule job runner (4 tests) |
+| ZeptoCapsule integration | ✅ Done | Library integration, capsule job runner (4 tests) |
 | Planner validation | ✅ Done | Plan structure validation, retry on malformed (5 tests) |
 | Integration tests | ✅ Done | Full orchestrator flow tests without daemon/LLM (4 tests) |
 | Agent-native CLI | ✅ Done | --json flag, agent-help, --agent-help (7 tests) |
@@ -49,7 +49,7 @@
 |------|-------|-------------|
 | `src/main.rs` | ~900 | CLI (clap): --json flag, agent-help, all commands with JSON envelope (7 tests) |
 | `src/lib.rs` | ~10 | Module exports |
-| `src/capsule.rs` | ~160 | ZeptoKernel integration: Job→JobSpec mapping, capsule job runner (4 tests) |
+| `src/capsule.rs` | ~160 | ZeptoCapsule integration: Job→JobSpec mapping, capsule job runner (4 tests) |
 | `src/config.rs` | ~200 | TOML parsing, $ENV_VAR expansion, validation (5 tests) |
 | `src/daemon.rs` | ~400 | Supervisor loop, agent lifecycle, config reload, orchestrator wiring |
 | `src/agent.rs` | ~300 | Process spawn, worker bridge, JSON-line IPC, orch event forwarding (3 tests) |
@@ -153,9 +153,9 @@ Replace in-memory RunStore with SQLite so runs survive daemon restarts.
 
 ---
 
-## Phase 7: ZeptoKernel Integration
+## Phase 7: ZeptoCapsule Integration
 
-Run orchestration jobs inside ZeptoKernel capsules instead of bare child processes.
+Run orchestration jobs inside ZeptoCapsule capsules instead of bare child processes.
 
 ### Tasks
 
@@ -164,7 +164,7 @@ Run orchestration jobs inside ZeptoKernel capsules instead of bare child process
   - Library integration chosen over binary — simpler, type-safe, no IPC overhead
 
 - [x] **7.2 — JobSpec mapping** (`src/capsule.rs`)
-  - `job_to_spec()` maps ZeptoPM `Job` → ZeptoKernel `JobSpec`
+  - `job_to_spec()` maps ZeptoPM `Job` → ZeptoCapsule `JobSpec`
   - Fields: job_id, run_id, role, instruction, env, limits, workspace
   - Input artifacts mapped with paths and artifact IDs
   - Environment passthrough for API keys (OPENROUTER_, OPENAI_, ANTHROPIC_)
@@ -189,7 +189,7 @@ Run orchestration jobs inside ZeptoKernel capsules instead of bare child process
 
 **Exit criteria:** `zeptopm run submit` with `isolation = "capsule"` + `worker_binary` spawns capsule.
 
-**Dependency:** ZeptoKernel M2.5 ✅ complete. zk-guest worker capabilities needed for E2E test.
+**Dependency:** ZeptoCapsule M2.5 ✅ complete. zk-guest worker capabilities needed for E2E test.
 
 ---
 
