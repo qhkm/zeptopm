@@ -323,6 +323,12 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                   spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
                 }
 
+                // Activate channels where all participants are now Running
+                let activated_channels = orchestrator.activate_ready_channels();
+                for ch_id in &activated_channels {
+                    info!(channel_id = %ch_id, "channel activated — all participants running");
+                }
+
                 // Persist to SQLite
                 if let Some(ref db) = db {
                   db.persist_run_state(&orchestrator.store, &run_id).ok();
@@ -475,6 +481,12 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                   spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
                 }
 
+                // Activate channels where all participants are now Running
+                let activated_channels = orchestrator.activate_ready_channels();
+                for ch_id in &activated_channels {
+                    info!(channel_id = %ch_id, "channel activated — all participants running");
+                }
+
                 // Persist run state to SQLite
                 if let Some(ref db) = db {
                   db.persist_run_state(&orchestrator.store, &run_id).ok();
@@ -490,11 +502,49 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                 orchestrator.mark_failed(&job_id, error.to_string());
                 warn!(job_id = %job_id, error = %error, "job failed");
 
+                // Check if failed job was a channel participant
+                let failed_channels: Vec<String> = orchestrator.store.channels_for_job(&job_id)
+                    .iter()
+                    .map(|c| c.channel_id.clone())
+                    .collect();
+                for ch_id in failed_channels {
+                    let action = orchestrator.handle_channel_peer_failure(&ch_id, &job_id);
+                    match action {
+                        crate::orchestrator::types::ChannelAction::KillParticipants { job_ids } => {
+                            for kill_id in &job_ids {
+                                warn!(job_id = %kill_id, channel = %ch_id, "killing channel peer due to KillAll policy");
+                                let worker_name = format!("__job_{}", kill_id);
+                                if let Some(internal) = managed.get(&worker_name) {
+                                    internal.handle.stop().await;
+                                }
+                                managed.remove(&worker_name);
+                                orchestrator.mark_failed(kill_id, format!("channel peer '{}' failed (KillAll)", job_id));
+                            }
+                        }
+                        crate::orchestrator::types::ChannelAction::NotifyPeers { job_ids, message } => {
+                            for peer_id in &job_ids {
+                                info!(job_id = %peer_id, channel = %ch_id, "notifying peer of disconnection");
+                                let worker_name = format!("__job_{}", peer_id);
+                                if let Some(internal) = managed.get(&worker_name) {
+                                    let _ = internal.handle.send_message(message.clone()).await;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Spawn retry if re-queued
                 while let Some(job) = orchestrator.next_job() {
                   info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry)");
                   orchestrator.mark_running(&job.job_id);
                   spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
+                }
+
+                // Activate channels where all participants are now Running
+                let activated_channels = orchestrator.activate_ready_channels();
+                for ch_id in &activated_channels {
+                    info!(channel_id = %ch_id, "channel activated — all participants running");
                 }
 
                 // Persist to SQLite
@@ -554,11 +604,49 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
               managed.remove(&worker_name);
               orchestrator.mark_failed(&job_id, "heartbeat timeout".into());
 
+              // Check if failed job was a channel participant
+              let failed_channels: Vec<String> = orchestrator.store.channels_for_job(&job_id)
+                  .iter()
+                  .map(|c| c.channel_id.clone())
+                  .collect();
+              for ch_id in failed_channels {
+                  let action = orchestrator.handle_channel_peer_failure(&ch_id, &job_id);
+                  match action {
+                      crate::orchestrator::types::ChannelAction::KillParticipants { job_ids } => {
+                          for kill_id in &job_ids {
+                              warn!(job_id = %kill_id, channel = %ch_id, "killing channel peer due to KillAll policy");
+                              let worker_name = format!("__job_{}", kill_id);
+                              if let Some(internal) = managed.get(&worker_name) {
+                                  internal.handle.stop().await;
+                              }
+                              managed.remove(&worker_name);
+                              orchestrator.mark_failed(kill_id, format!("channel peer '{}' failed (KillAll)", job_id));
+                          }
+                      }
+                      crate::orchestrator::types::ChannelAction::NotifyPeers { job_ids, message } => {
+                          for peer_id in &job_ids {
+                              info!(job_id = %peer_id, channel = %ch_id, "notifying peer of disconnection");
+                              let worker_name = format!("__job_{}", peer_id);
+                              if let Some(internal) = managed.get(&worker_name) {
+                                  let _ = internal.handle.send_message(message.clone()).await;
+                              }
+                          }
+                      }
+                      _ => {}
+                  }
+              }
+
               // Spawn retries if re-queued
               while let Some(job) = orchestrator.next_job() {
                 info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry after timeout)");
                 orchestrator.mark_running(&job.job_id);
                 spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
+              }
+
+              // Activate channels where all participants are now Running
+              let activated_channels = orchestrator.activate_ready_channels();
+              for ch_id in &activated_channels {
+                  info!(channel_id = %ch_id, "channel activated — all participants running");
               }
 
               // Persist to SQLite
