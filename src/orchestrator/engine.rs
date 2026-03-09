@@ -239,6 +239,48 @@ impl OrchestratorEngine {
         Some((new_coder_id, new_reviewer_id))
     }
 
+    /// Activate channels whose participants are all Running.
+    /// Returns list of activated channel IDs.
+    pub fn activate_ready_channels(&mut self) -> Vec<ChannelId> {
+        let run_ids: Vec<RunId> = self
+            .active_jobs
+            .values()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut activated = Vec::new();
+
+        for run_id in &run_ids {
+            let channel_ids: Vec<ChannelId> = self
+                .store
+                .list_run_channels(run_id)
+                .iter()
+                .filter(|c| !c.active)
+                .map(|c| c.channel_id.clone())
+                .collect();
+
+            for ch_id in channel_ids {
+                let all_running = {
+                    let ch = self.store.get_channel(&ch_id).unwrap();
+                    ch.participants.iter().all(|p| {
+                        self.store
+                            .get_job(p)
+                            .map(|j| j.status == JobStatus::Running)
+                            .unwrap_or(false)
+                    })
+                };
+                if all_running {
+                    if let Some(ch) = self.store.get_channel_mut(&ch_id) {
+                        ch.active = true;
+                    }
+                    activated.push(ch_id);
+                }
+            }
+        }
+        activated
+    }
+
     /// Mark a job as failed. Retries if attempts remain.
     pub fn mark_failed(&mut self, job_id: &str, error: String) {
         self.last_heartbeat.remove(job_id);
@@ -595,5 +637,145 @@ mod tests {
             engine.store.get_run(&run_id).unwrap().status,
             RunStatus::Running
         );
+    }
+
+    #[test]
+    fn test_activate_channels_when_participants_running() {
+        let mut engine = OrchestratorEngine::new(4);
+        let run_id = engine.submit_run("test".into());
+
+        let job_a = gen_id("job");
+        let job_b = gen_id("job");
+        engine.store.create_job(Job {
+            job_id: job_a.clone(),
+            run_id: run_id.clone(),
+            parent_job_id: None,
+            role: "writer".into(),
+            status: JobStatus::Running,
+            instruction: "write".into(),
+            input_artifact_ids: vec![],
+            depends_on: vec![],
+            children: vec![],
+            profile_id: "writer".into(),
+            workspace_dir: std::path::PathBuf::from("/tmp"),
+            attempt: 1,
+            max_attempts: 3,
+            created_at: SystemTime::now(),
+            started_at: Some(SystemTime::now()),
+            finished_at: None,
+            output_artifact_ids: vec![],
+            error: None,
+            revision_round: 0,
+        });
+        engine.store.create_job(Job {
+            job_id: job_b.clone(),
+            run_id: run_id.clone(),
+            parent_job_id: None,
+            role: "reviewer".into(),
+            status: JobStatus::Running,
+            instruction: "review".into(),
+            input_artifact_ids: vec![],
+            depends_on: vec![],
+            children: vec![],
+            profile_id: "reviewer".into(),
+            workspace_dir: std::path::PathBuf::from("/tmp"),
+            attempt: 1,
+            max_attempts: 3,
+            created_at: SystemTime::now(),
+            started_at: Some(SystemTime::now()),
+            finished_at: None,
+            output_artifact_ids: vec![],
+            error: None,
+            revision_round: 0,
+        });
+        engine.active_jobs.insert(job_a.clone(), run_id.clone());
+        engine.active_jobs.insert(job_b.clone(), run_id.clone());
+
+        engine.store.create_channel(Channel {
+            channel_id: "ch1".into(),
+            run_id: run_id.clone(),
+            participants: vec![job_a.clone(), job_b.clone()],
+            mode: ChannelMode::TurnBased,
+            max_rounds: Some(3),
+            on_peer_failure: PeerFailure::KillAll,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: false,
+            history: vec![],
+        });
+
+        let activated = engine.activate_ready_channels();
+        assert_eq!(activated.len(), 1);
+        assert_eq!(activated[0], "ch1");
+        assert!(engine.store.get_channel("ch1").unwrap().active);
+    }
+
+    #[test]
+    fn test_channel_not_activated_if_participant_pending() {
+        let mut engine = OrchestratorEngine::new(4);
+        let run_id = engine.submit_run("test".into());
+
+        let job_a = gen_id("job");
+        let job_b = gen_id("job");
+        engine.store.create_job(Job {
+            job_id: job_a.clone(),
+            run_id: run_id.clone(),
+            parent_job_id: None,
+            role: "writer".into(),
+            status: JobStatus::Running,
+            instruction: "write".into(),
+            input_artifact_ids: vec![],
+            depends_on: vec![],
+            children: vec![],
+            profile_id: "writer".into(),
+            workspace_dir: std::path::PathBuf::from("/tmp"),
+            attempt: 1,
+            max_attempts: 3,
+            created_at: SystemTime::now(),
+            started_at: Some(SystemTime::now()),
+            finished_at: None,
+            output_artifact_ids: vec![],
+            error: None,
+            revision_round: 0,
+        });
+        engine.store.create_job(Job {
+            job_id: job_b.clone(),
+            run_id: run_id.clone(),
+            parent_job_id: None,
+            role: "reviewer".into(),
+            status: JobStatus::Pending,
+            instruction: "review".into(),
+            input_artifact_ids: vec![],
+            depends_on: vec![job_a.clone()],
+            children: vec![],
+            profile_id: "reviewer".into(),
+            workspace_dir: std::path::PathBuf::from("/tmp"),
+            attempt: 0,
+            max_attempts: 3,
+            created_at: SystemTime::now(),
+            started_at: None,
+            finished_at: None,
+            output_artifact_ids: vec![],
+            error: None,
+            revision_round: 0,
+        });
+        engine.active_jobs.insert(job_a.clone(), run_id.clone());
+
+        engine.store.create_channel(Channel {
+            channel_id: "ch1".into(),
+            run_id: run_id.clone(),
+            participants: vec![job_a.clone(), job_b.clone()],
+            mode: ChannelMode::TurnBased,
+            max_rounds: None,
+            on_peer_failure: PeerFailure::KillAll,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: false,
+            history: vec![],
+        });
+
+        let activated = engine.activate_ready_channels();
+        assert!(activated.is_empty());
+        assert!(!engine.store.get_channel("ch1").unwrap().active);
     }
 }
