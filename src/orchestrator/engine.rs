@@ -342,14 +342,23 @@ impl OrchestratorEngine {
                 }
             }
             ChannelMode::Stream => {
-                let next_job = participants
+                let targets: Vec<JobId> = participants
                     .iter()
-                    .find(|p| p.as_str() != from_job)
+                    .filter(|p| p.as_str() != from_job)
                     .cloned()
-                    .unwrap_or_default();
-                ChannelAction::SendTo {
-                    job_id: next_job,
-                    message: content.into(),
+                    .collect();
+                if targets.is_empty() {
+                    ChannelAction::NoOp
+                } else if targets.len() == 1 {
+                    ChannelAction::SendTo {
+                        job_id: targets.into_iter().next().unwrap(),
+                        message: content.into(),
+                    }
+                } else {
+                    ChannelAction::Broadcast {
+                        job_ids: targets,
+                        message: content.into(),
+                    }
                 }
             }
         }
@@ -991,6 +1000,66 @@ mod tests {
                 assert!(message.contains("disconnected"));
             }
             _ => panic!("expected NotifyPeers"),
+        }
+    }
+
+    #[test]
+    fn test_stream_mode_routing() {
+        let mut engine = OrchestratorEngine::new(4);
+
+        let ch = Channel {
+            channel_id: "pipeline".into(),
+            run_id: "run_1".into(),
+            participants: vec!["researcher".into(), "writer".into()],
+            mode: ChannelMode::Stream,
+            max_rounds: None,
+            on_peer_failure: PeerFailure::Continue,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: true,
+            history: vec![],
+            initial_message: None,
+        };
+        engine.store.create_channel(ch);
+
+        let action = engine.route_channel_message("pipeline", "researcher", "Found some data");
+        match action {
+            ChannelAction::SendTo { job_id, message } => {
+                assert_eq!(job_id, "writer");
+                assert!(message.contains("Found some data"));
+            }
+            _ => panic!("expected SendTo for 2-participant stream"),
+        }
+    }
+
+    #[test]
+    fn test_stream_mode_broadcast_three_participants() {
+        let mut engine = OrchestratorEngine::new(4);
+
+        let ch = Channel {
+            channel_id: "multi".into(),
+            run_id: "run_1".into(),
+            participants: vec!["source".into(), "sink_a".into(), "sink_b".into()],
+            mode: ChannelMode::Stream,
+            max_rounds: None,
+            on_peer_failure: PeerFailure::Continue,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: true,
+            history: vec![],
+            initial_message: None,
+        };
+        engine.store.create_channel(ch);
+
+        let action = engine.route_channel_message("multi", "source", "data chunk");
+        match action {
+            ChannelAction::Broadcast { job_ids, message } => {
+                assert_eq!(job_ids.len(), 2);
+                assert!(job_ids.contains(&"sink_a".to_string()));
+                assert!(job_ids.contains(&"sink_b".to_string()));
+                assert!(message.contains("data chunk"));
+            }
+            _ => panic!("expected Broadcast for 3-participant stream, got {:?}", action),
         }
     }
 

@@ -132,6 +132,7 @@ pub struct PlannedChannel {
 #[derive(Debug, Clone)]
 pub enum ChannelAction {
     SendTo { job_id: JobId, message: String },
+    Broadcast { job_ids: Vec<JobId>, message: String },
     Close { channel_id: ChannelId },
     KillParticipants { job_ids: Vec<JobId> },
     NotifyPeers { job_ids: Vec<JobId>, message: String },

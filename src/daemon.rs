@@ -594,6 +594,15 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                             let _ = internal.handle.send_message(message).await;
                         }
                     }
+                    crate::orchestrator::types::ChannelAction::Broadcast { job_ids, message } => {
+                        for target_id in &job_ids {
+                            let worker_name = format!("__job_{}", target_id);
+                            if let Some(internal) = managed.get(&worker_name) {
+                                info!(channel = %channel_id, to = %target_id, "broadcasting channel message");
+                                let _ = internal.handle.send_message(message.clone()).await;
+                            }
+                        }
+                    }
                     crate::orchestrator::types::ChannelAction::Close { channel_id } => {
                         info!(channel = %channel_id, "channel closed — max rounds or done");
                     }
