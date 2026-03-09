@@ -281,6 +281,129 @@ impl OrchestratorEngine {
         activated
     }
 
+    /// Route a message from a channel participant to the next.
+    /// Returns the action the daemon should take.
+    pub fn route_channel_message(
+        &mut self,
+        channel_id: &str,
+        from_job: &str,
+        content: &str,
+    ) -> ChannelAction {
+        let (participants, mode, max_rounds, next_speaker, new_round) = {
+            let ch = match self.store.get_channel(channel_id) {
+                Some(c) if c.active => c,
+                _ => return ChannelAction::NoOp,
+            };
+            let next_idx = (ch.current_speaker_idx + 1) % ch.participants.len();
+            let new_round = if next_idx == 0 {
+                ch.current_round + 1
+            } else {
+                ch.current_round
+            };
+            (
+                ch.participants.clone(),
+                ch.mode.clone(),
+                ch.max_rounds,
+                next_idx,
+                new_round,
+            )
+        };
+
+        // Record the message in history
+        if let Some(ch) = self.store.get_channel_mut(channel_id) {
+            ch.history.push(ChannelMessage {
+                from_job: from_job.into(),
+                content: content.into(),
+                timestamp: SystemTime::now(),
+                round: ch.current_round,
+            });
+            ch.current_speaker_idx = next_speaker;
+            ch.current_round = new_round;
+        }
+
+        // Check max_rounds termination
+        if let Some(max) = max_rounds {
+            if new_round >= max {
+                if let Some(ch) = self.store.get_channel_mut(channel_id) {
+                    ch.active = false;
+                }
+                return ChannelAction::Close {
+                    channel_id: channel_id.into(),
+                };
+            }
+        }
+
+        match mode {
+            ChannelMode::TurnBased => {
+                let next_job = participants[next_speaker].clone();
+                ChannelAction::SendTo {
+                    job_id: next_job,
+                    message: content.into(),
+                }
+            }
+            ChannelMode::Stream => {
+                let next_job = participants
+                    .iter()
+                    .find(|p| p.as_str() != from_job)
+                    .cloned()
+                    .unwrap_or_default();
+                ChannelAction::SendTo {
+                    job_id: next_job,
+                    message: content.into(),
+                }
+            }
+        }
+    }
+
+    /// Handle a channel_done signal from a participant.
+    pub fn handle_channel_done(
+        &mut self,
+        channel_id: &str,
+        _from_job: &str,
+    ) -> ChannelAction {
+        if let Some(ch) = self.store.get_channel_mut(channel_id) {
+            ch.active = false;
+        }
+        ChannelAction::Close {
+            channel_id: channel_id.into(),
+        }
+    }
+
+    /// Handle peer failure — when a participant dies or is killed.
+    pub fn handle_channel_peer_failure(
+        &mut self,
+        channel_id: &str,
+        failed_job: &str,
+    ) -> ChannelAction {
+        let (on_failure, surviving) = {
+            let ch = match self.store.get_channel(channel_id) {
+                Some(c) => c,
+                None => return ChannelAction::NoOp,
+            };
+            let surviving: Vec<JobId> = ch
+                .participants
+                .iter()
+                .filter(|p| p.as_str() != failed_job)
+                .cloned()
+                .collect();
+            (ch.on_peer_failure.clone(), surviving)
+        };
+
+        if let Some(ch) = self.store.get_channel_mut(channel_id) {
+            ch.active = false;
+        }
+
+        match on_failure {
+            PeerFailure::KillAll => {
+                ChannelAction::KillParticipants { job_ids: surviving }
+            }
+            PeerFailure::Continue => ChannelAction::NotifyPeers {
+                job_ids: surviving,
+                message: format!("peer '{}' disconnected", failed_job),
+            },
+        }
+    }
+
     /// Mark a job as failed. Retries if attempts remain.
     pub fn mark_failed(&mut self, job_id: &str, error: String) {
         self.last_heartbeat.remove(job_id);
@@ -708,6 +831,161 @@ mod tests {
         assert_eq!(activated.len(), 1);
         assert_eq!(activated[0], "ch1");
         assert!(engine.store.get_channel("ch1").unwrap().active);
+    }
+
+    #[test]
+    fn test_advance_turn_based_channel() {
+        let mut engine = OrchestratorEngine::new(4);
+
+        let ch = Channel {
+            channel_id: "ch1".into(),
+            run_id: "run_1".into(),
+            participants: vec!["job_A".into(), "job_B".into()],
+            mode: ChannelMode::TurnBased,
+            max_rounds: Some(3),
+            on_peer_failure: PeerFailure::KillAll,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: true,
+            history: vec![],
+        };
+        engine.store.create_channel(ch);
+
+        let action =
+            engine.route_channel_message("ch1", "job_A", "Here is my draft");
+        match action {
+            ChannelAction::SendTo { job_id, message } => {
+                assert_eq!(job_id, "job_B");
+                assert!(message.contains("Here is my draft"));
+            }
+            _ => panic!("expected SendTo"),
+        }
+
+        let ch = engine.store.get_channel("ch1").unwrap();
+        assert_eq!(ch.current_speaker_idx, 1);
+        assert_eq!(ch.history.len(), 1);
+    }
+
+    #[test]
+    fn test_channel_max_rounds_termination() {
+        let mut engine = OrchestratorEngine::new(4);
+
+        let ch = Channel {
+            channel_id: "ch1".into(),
+            run_id: "run_1".into(),
+            participants: vec!["job_A".into(), "job_B".into()],
+            mode: ChannelMode::TurnBased,
+            max_rounds: Some(1),
+            on_peer_failure: PeerFailure::KillAll,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: true,
+            history: vec![],
+        };
+        engine.store.create_channel(ch);
+
+        // A speaks (round 0, speaker 0 -> speaker 1)
+        let _ = engine.route_channel_message("ch1", "job_A", "draft");
+        // B speaks (round 0, speaker 1 -> round 1, speaker 0) — hits max_rounds
+        let action =
+            engine.route_channel_message("ch1", "job_B", "looks good");
+
+        match action {
+            ChannelAction::Close { channel_id } => {
+                assert_eq!(channel_id, "ch1");
+            }
+            _ => {
+                panic!(
+                    "expected Close after max_rounds reached, got {:?}",
+                    action
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn test_channel_done_signal() {
+        let mut engine = OrchestratorEngine::new(4);
+
+        let ch = Channel {
+            channel_id: "ch1".into(),
+            run_id: "run_1".into(),
+            participants: vec!["job_A".into(), "job_B".into()],
+            mode: ChannelMode::TurnBased,
+            max_rounds: None,
+            on_peer_failure: PeerFailure::KillAll,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: true,
+            history: vec![],
+        };
+        engine.store.create_channel(ch);
+
+        let action = engine.handle_channel_done("ch1", "job_A");
+        match action {
+            ChannelAction::Close { channel_id } => {
+                assert_eq!(channel_id, "ch1");
+            }
+            _ => panic!("expected Close"),
+        }
+        assert!(!engine.store.get_channel("ch1").unwrap().active);
+    }
+
+    #[test]
+    fn test_peer_failure_kill_all() {
+        let mut engine = OrchestratorEngine::new(4);
+
+        let ch = Channel {
+            channel_id: "ch1".into(),
+            run_id: "run_1".into(),
+            participants: vec!["job_A".into(), "job_B".into()],
+            mode: ChannelMode::TurnBased,
+            max_rounds: None,
+            on_peer_failure: PeerFailure::KillAll,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: true,
+            history: vec![],
+        };
+        engine.store.create_channel(ch);
+
+        let action =
+            engine.handle_channel_peer_failure("ch1", "job_A");
+        match action {
+            ChannelAction::KillParticipants { job_ids } => {
+                assert!(job_ids.contains(&"job_B".to_string()));
+            }
+            _ => panic!("expected KillParticipants"),
+        }
+    }
+
+    #[test]
+    fn test_peer_failure_continue() {
+        let mut engine = OrchestratorEngine::new(4);
+
+        let ch = Channel {
+            channel_id: "ch1".into(),
+            run_id: "run_1".into(),
+            participants: vec!["job_A".into(), "job_B".into()],
+            mode: ChannelMode::TurnBased,
+            max_rounds: None,
+            on_peer_failure: PeerFailure::Continue,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: true,
+            history: vec![],
+        };
+        engine.store.create_channel(ch);
+
+        let action =
+            engine.handle_channel_peer_failure("ch1", "job_A");
+        match action {
+            ChannelAction::NotifyPeers { job_ids, message } => {
+                assert!(job_ids.contains(&"job_B".to_string()));
+                assert!(message.contains("disconnected"));
+            }
+            _ => panic!("expected NotifyPeers"),
+        }
     }
 
     #[test]
