@@ -57,6 +57,31 @@ pub fn validate_plan(plan: &ExecutionPlan) -> Vec<String> {
         }
     }
 
+    // Validate channels
+    let mut seen_channels = std::collections::HashSet::new();
+    for (i, ch) in plan.channels.iter().enumerate() {
+        if !seen_channels.insert(&ch.channel_id) {
+            errors.push(format!("duplicate channel_id: '{}'", ch.channel_id));
+        }
+        if ch.participants.is_empty() {
+            errors.push(format!("channel[{}] '{}': no participants", i, ch.channel_id));
+        }
+        if ch.mode == ChannelMode::TurnBased && ch.participants.len() < 2 {
+            errors.push(format!(
+                "channel[{}] '{}': TurnBased requires at least 2 participants",
+                i, ch.channel_id
+            ));
+        }
+        for p in &ch.participants {
+            if !local_ids.contains(p.as_str()) {
+                errors.push(format!(
+                    "channel[{}] '{}': participant '{}' not found in plan jobs",
+                    i, ch.channel_id, p
+                ));
+            }
+        }
+    }
+
     errors
 }
 
@@ -282,5 +307,138 @@ mod tests {
         };
         let errors = validate_plan(&plan);
         assert!(errors.len() >= 3); // role, profile_id, instruction
+    }
+
+    #[test]
+    fn test_validate_plan_with_valid_channels() {
+        let plan = ExecutionPlan {
+            jobs: vec![
+                PlannedJob {
+                    local_id: "writer".into(),
+                    role: "writer".into(),
+                    profile_id: "writer".into(),
+                    instruction: "Write".into(),
+                    depends_on: vec![],
+                },
+                PlannedJob {
+                    local_id: "reviewer".into(),
+                    role: "reviewer".into(),
+                    profile_id: "reviewer".into(),
+                    instruction: "Review".into(),
+                    depends_on: vec![],
+                },
+            ],
+            channels: vec![PlannedChannel {
+                channel_id: "draft-review".into(),
+                participants: vec!["writer".into(), "reviewer".into()],
+                mode: ChannelMode::TurnBased,
+                max_rounds: Some(3),
+                on_peer_failure: PeerFailure::KillAll,
+                initial_message: Some("Write a blog post".into()),
+            }],
+        };
+        assert!(validate_plan(&plan).is_empty());
+    }
+
+    #[test]
+    fn test_validate_channel_unknown_participant() {
+        let plan = ExecutionPlan {
+            jobs: vec![PlannedJob {
+                local_id: "writer".into(),
+                role: "writer".into(),
+                profile_id: "writer".into(),
+                instruction: "Write".into(),
+                depends_on: vec![],
+            }],
+            channels: vec![PlannedChannel {
+                channel_id: "ch1".into(),
+                participants: vec!["writer".into(), "ghost".into()],
+                mode: ChannelMode::TurnBased,
+                max_rounds: None,
+                on_peer_failure: PeerFailure::KillAll,
+                initial_message: None,
+            }],
+        };
+        let errors = validate_plan(&plan);
+        assert!(errors.iter().any(|e| e.contains("ghost") && e.contains("not found")));
+    }
+
+    #[test]
+    fn test_validate_channel_duplicate_id() {
+        let plan = ExecutionPlan {
+            jobs: vec![PlannedJob {
+                local_id: "a".into(),
+                role: "r".into(),
+                profile_id: "r".into(),
+                instruction: "do".into(),
+                depends_on: vec![],
+            }],
+            channels: vec![
+                PlannedChannel {
+                    channel_id: "ch1".into(),
+                    participants: vec!["a".into()],
+                    mode: ChannelMode::TurnBased,
+                    max_rounds: None,
+                    on_peer_failure: PeerFailure::KillAll,
+                    initial_message: None,
+                },
+                PlannedChannel {
+                    channel_id: "ch1".into(),
+                    participants: vec!["a".into()],
+                    mode: ChannelMode::Stream,
+                    max_rounds: None,
+                    on_peer_failure: PeerFailure::Continue,
+                    initial_message: None,
+                },
+            ],
+        };
+        let errors = validate_plan(&plan);
+        assert!(errors.iter().any(|e| e.contains("duplicate") && e.contains("ch1")));
+    }
+
+    #[test]
+    fn test_validate_channel_empty_participants() {
+        let plan = ExecutionPlan {
+            jobs: vec![PlannedJob {
+                local_id: "a".into(),
+                role: "r".into(),
+                profile_id: "r".into(),
+                instruction: "do".into(),
+                depends_on: vec![],
+            }],
+            channels: vec![PlannedChannel {
+                channel_id: "ch1".into(),
+                participants: vec![],
+                mode: ChannelMode::TurnBased,
+                max_rounds: None,
+                on_peer_failure: PeerFailure::KillAll,
+                initial_message: None,
+            }],
+        };
+        let errors = validate_plan(&plan);
+        assert!(errors.iter().any(|e| e.contains("no participants")));
+    }
+
+    #[test]
+    fn test_validate_turn_based_needs_two_participants() {
+        let plan = ExecutionPlan {
+            jobs: vec![PlannedJob {
+                local_id: "a".into(),
+                role: "r".into(),
+                profile_id: "r".into(),
+                instruction: "do".into(),
+                depends_on: vec![],
+            }],
+            channels: vec![PlannedChannel {
+                channel_id: "ch1".into(),
+                participants: vec!["a".into()],
+                mode: ChannelMode::TurnBased,
+                max_rounds: None,
+                on_peer_failure: PeerFailure::KillAll,
+                initial_message: None,
+            }],
+        };
+        let errors = validate_plan(&plan);
+        assert!(errors.iter().any(|e| e.contains("TurnBased") && e.contains("at least 2")));
     }
 }
