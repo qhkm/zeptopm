@@ -9,7 +9,7 @@
 [![macOS](https://img.shields.io/badge/macOS-supported-brightgreen.svg)]()
 [![Linux](https://img.shields.io/badge/Linux-supported-brightgreen.svg)]()
 
-**`~4 MB per agent`** · **`11 MB binary`** · **`near-zero idle CPU`** · **`1000+ agents on 4 GB RAM`**
+**`~7 MB per agent`** · **`11 MB binary`** · **`near-zero idle CPU`** · **`500+ agents on 4 GB RAM`**
 
 [Quick Start](#-quick-start) · [Features](#-features) · [Channels](#-agent-channels) · [HTTP API](#-http-api) · [Config](#-config-reference)
 
@@ -43,7 +43,7 @@ Symphony manages work at a high level. ZeptoPM manages the agents doing the work
 
 🔧 **Config-driven** — define agents in TOML, no code required
 
-🔒 **Process isolation** — separate OS process per agent (~4 MB)
+🔒 **Process isolation** — separate OS process per agent (~7 MB)
 
 💾 **Session persistence** — agents remember conversations across restarts
 
@@ -257,8 +257,8 @@ With `--sandbox` or `isolation = "capsule"` in config, orchestrated jobs run ins
 
 | Component | RSS (idle) |
 |:----------|:----------|
-| Daemon (supervisor) | **~4 MB** |
-| Each worker process | **~4 MB** |
+| Daemon (supervisor) | **~7 MB** |
+| Each worker process | **~7 MB** |
 | Release binary | **~11 MB** |
 
 <details>
@@ -266,13 +266,13 @@ With `--sandbox` or `isolation = "capsule"` in config, orchestrated jobs run ins
 
 | Machine RAM | Agents (max) | Agents (comfortable) |
 |:------------|:-------------|:---------------------|
-| 512 MB | ~120 | 50–80 |
-| 1 GB | ~250 | 100–150 |
-| 4 GB | ~1,000 | 500–800 |
-| 8 GB | ~2,000 | 1,000+ |
+| 512 MB | ~70 | 30–50 |
+| 1 GB | ~140 | 60–100 |
+| 4 GB | ~570 | 300–450 |
+| 8 GB | ~1,140 | 600–900 |
 
 - CPU is near-zero while idle — workers block on stdin.
-- Memory grows with conversation history (~40 KB per agent with `max_history = 200`).
+- Memory grows with conversation history. With `max_history = 200`, each agent adds ~40 KB on top of the base ~7 MB.
 - The real constraint is **LLM API rate limits and cost**, not local resources.
 - A **$5/month VPS** can comfortably run dozens of agents.
 
