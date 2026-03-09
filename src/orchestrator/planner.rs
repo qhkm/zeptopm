@@ -151,7 +151,7 @@ pub fn materialize_plan(
             .collect();
 
         let channel = Channel {
-            channel_id: planned_ch.channel_id.clone(),
+            channel_id: format!("{}:{}", run_id, planned_ch.channel_id),
             run_id: run_id.into(),
             participants: real_participants,
             mode: planned_ch.mode.clone(),
@@ -503,7 +503,7 @@ mod tests {
         let channels = store.list_run_channels("run_1");
         assert_eq!(channels.len(), 1);
         let ch = channels[0];
-        assert_eq!(ch.channel_id, "draft-review");
+        assert_eq!(ch.channel_id, "run_1:draft-review");
         assert_eq!(ch.participants.len(), 2);
         assert_eq!(ch.participants[0], job_ids[0]); // writer's real ID
         assert_eq!(ch.participants[1], job_ids[1]); // reviewer's real ID
