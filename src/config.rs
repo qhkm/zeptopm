@@ -248,14 +248,22 @@ pub fn validate_config(config: &Config) -> Vec<String> {
 
 /// Compute a simple hash of the config for change detection.
 ///
-/// Covers agent identity and process fields used to decide whether to restart a worker.
-/// Capsule resource limits (`memory_mib`, `max_pids`, `timeout_sec`) are intentionally
-/// excluded — they are re-read per-job at dispatch time and do not require a restart.
+/// Covers agent identity/process fields plus daemon settings that affect orchestration
+/// dispatch or scheduling during runtime. Capsule resource limits (`memory_mib`,
+/// `max_pids`, `timeout_sec`) are intentionally excluded — they are re-read per-job at
+/// dispatch time and do not require a restart.
 pub fn config_hash(config: &Config) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
+    config.daemon.isolation.hash(&mut hasher);
+    config.daemon.worker_binary.hash(&mut hasher);
+    config.daemon.zeptoclaw_binary.hash(&mut hasher);
+    config.daemon.run_ttl_days.hash(&mut hasher);
+    config.daemon.security.hash(&mut hasher);
+    config.daemon.cgroup_required.hash(&mut hasher);
+    config.daemon.max_revisions.hash(&mut hasher);
     for agent in &config.agents {
         agent.name.hash(&mut hasher);
         agent.provider.hash(&mut hasher);
@@ -445,6 +453,19 @@ mod tests {
         let h1 = config_hash(&config);
         let h2 = config_hash(&config);
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_config_hash_changes_when_daemon_isolation_changes() {
+        let mut config = Config {
+            daemon: DaemonConfig::default(),
+            agents: vec![],
+            providers: HashMap::new(),
+        };
+        let h1 = config_hash(&config);
+        config.daemon.isolation = "process".into();
+        let h2 = config_hash(&config);
+        assert_ne!(h1, h2);
     }
 
     #[test]

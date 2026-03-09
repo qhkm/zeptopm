@@ -38,8 +38,12 @@ enum Commands {
         #[arg(short, long)]
         bind: Option<String>,
 
+        /// Force capsule isolation for orchestrated jobs
+        #[arg(long, conflicts_with = "no_sandbox")]
+        sandbox: bool,
+
         /// Disable capsule isolation — run jobs as plain child processes
-        #[arg(long)]
+        #[arg(long, conflicts_with = "sandbox")]
         no_sandbox: bool,
     },
     /// Show status of all running agents (queries daemon)
@@ -203,7 +207,11 @@ async fn main() {
     }
 
     match cli.command {
-        Some(Commands::Daemon { bind, no_sandbox }) => {
+        Some(Commands::Daemon {
+            bind,
+            sandbox,
+            no_sandbox,
+        }) => {
             // Load config to get log settings
             let config = zeptopm::config::load_config(&cli.config).unwrap_or_else(|e| {
                 eprintln!("Failed to load config: {}", e);
@@ -213,8 +221,12 @@ async fn main() {
             let log_level = cli.log_level.as_deref().unwrap_or(&config.daemon.log_level);
             init_tracing(log_level, &config.daemon.log_format);
 
-            let sandbox = !no_sandbox;
-            zeptopm::daemon::run(cli.config, bind, sandbox).await;
+            let sandbox_override = match (sandbox, no_sandbox) {
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                _ => None,
+            };
+            zeptopm::daemon::run(cli.config, bind, sandbox_override).await;
         }
         Some(Commands::Status) => {
             let result: CliResult = match http_get(&cli.addr, "/status").await {
@@ -716,7 +728,7 @@ async fn main() {
             let log_level = cli.log_level.as_deref().unwrap_or(&config.daemon.log_level);
             init_tracing(log_level, &config.daemon.log_format);
 
-            zeptopm::daemon::run(cli.config, None, true).await;
+            zeptopm::daemon::run(cli.config, None, None).await;
         }
     }
 }
@@ -1209,5 +1221,27 @@ mod tests {
     fn test_manifest_version_present() {
         let manifest = build_manifest();
         assert!(manifest.get("version").and_then(|v| v.as_str()).is_some());
+    }
+
+    #[test]
+    fn test_daemon_cli_accepts_sandbox_flag() {
+        let cli = Cli::try_parse_from(["zeptopm", "daemon", "--sandbox"]).unwrap();
+        match cli.command {
+            Some(Commands::Daemon {
+                sandbox,
+                no_sandbox,
+                ..
+            }) => {
+                assert!(sandbox);
+                assert!(!no_sandbox);
+            }
+            other => panic!("unexpected command parsed: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_daemon_cli_rejects_conflicting_sandbox_flags() {
+        let err = Cli::try_parse_from(["zeptopm", "daemon", "--sandbox", "--no-sandbox"]);
+        assert!(err.is_err());
     }
 }

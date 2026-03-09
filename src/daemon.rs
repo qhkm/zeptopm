@@ -14,9 +14,9 @@ use crate::server::{self, DaemonCommand, ManagedAgentRef, ResolvedGatewayConfig,
 
 /// Run the daemon. This is the main entry point.
 ///
-/// When `sandbox` is true (default), orchestrated jobs run inside ZeptoKernel capsules.
-/// Pass `--no-sandbox` to disable and spawn jobs as plain child processes.
-pub async fn run(config_path: String, bind: Option<String>, sandbox: bool) {
+/// CLI sandbox flags override `daemon.isolation`; otherwise config decides whether
+/// orchestrated jobs run inside ZeptoKernel capsules or as plain child processes.
+pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Option<bool>) {
     let config = match config::load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -36,14 +36,11 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox: bool) {
     info!(
         agents = config.agents.len(),
         poll_interval_ms = config.daemon.poll_interval_ms,
-        sandbox = sandbox,
+        sandbox_mode = sandbox_mode_label(&config, sandbox_override),
         "zeptopm daemon starting"
     );
 
-    #[cfg(not(feature = "capsule"))]
-    if sandbox {
-        warn!("--sandbox requires zeptoPM built with 'capsule' feature (cargo build --features capsule) — running without isolation");
-    }
+    warn_if_sandbox_unavailable(&config, sandbox_override);
 
     let daemon_start = Instant::now();
     let (state_tx, mut state_rx) = mpsc::channel::<AgentStateUpdate>(256);
@@ -323,7 +320,7 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox: bool) {
                 while let Some(job) = orchestrator.next_job() {
                   info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
                   orchestrator.mark_running(&job.job_id);
-                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox).await;
+                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
                 }
 
                 // Persist to SQLite
@@ -475,7 +472,7 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox: bool) {
                 while let Some(job) = orchestrator.next_job() {
                   info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
                   orchestrator.mark_running(&job.job_id);
-                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox).await;
+                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
                 }
 
                 // Persist run state to SQLite
@@ -497,7 +494,7 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox: bool) {
                 while let Some(job) = orchestrator.next_job() {
                   info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry)");
                   orchestrator.mark_running(&job.job_id);
-                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox).await;
+                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
                 }
 
                 // Persist to SQLite
@@ -538,6 +535,7 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox: bool) {
                 apply_config_changes(&mut managed, &shared_state, &new_config, &config_path, state_tx.clone()).await;
                 current_config = new_config;
                 last_config_hash = new_hash;
+                warn_if_sandbox_unavailable(&current_config, sandbox_override);
               }
             }
 
@@ -560,7 +558,7 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox: bool) {
               while let Some(job) = orchestrator.next_job() {
                 info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry after timeout)");
                 orchestrator.mark_running(&job.job_id);
-                spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox).await;
+                spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
               }
 
               // Persist to SQLite
@@ -783,7 +781,7 @@ async fn apply_config_changes(
 
 /// Spawn a temporary worker process for an orchestration job.
 ///
-/// When `sandbox` is true, uses ZeptoKernel capsule isolation.
+/// When sandboxing is active, uses ZeptoKernel capsule isolation.
 /// Otherwise spawns a bare child process.
 async fn spawn_job_worker(
     job: &crate::orchestrator::types::Job,
@@ -794,12 +792,11 @@ async fn spawn_job_worker(
     _managed: &mut HashMap<String, InternalAgent>,
     _shared_state: &SharedState,
     orchestrator_store: &crate::orchestrator::store::RunStore,
-    sandbox: bool,
+    _sandbox_override: Option<bool>,
 ) {
-    let _ = sandbox; // used only when `capsule` feature is enabled
     // Sandbox mode — delegate to ZeptoKernel capsule
     #[cfg(feature = "capsule")]
-    if sandbox {
+    if sandbox_requested(config, _sandbox_override) {
         let (handle, join) =
             crate::capsule::spawn_capsule_job(job, config, orch_event_tx, orchestrator_store);
         let worker_name = format!("__job_{}", job.job_id);
@@ -897,6 +894,31 @@ async fn spawn_job_worker(
         },
     );
 }
+
+fn sandbox_requested(config: &Config, sandbox_override: Option<bool>) -> bool {
+    sandbox_override.unwrap_or(config.daemon.isolation != "none")
+}
+
+fn sandbox_mode_label(config: &Config, sandbox_override: Option<bool>) -> &'static str {
+    match sandbox_override {
+        Some(true) => "forced_on",
+        Some(false) => "forced_off",
+        None if config.daemon.isolation == "none" => "config_off",
+        None => "config_on",
+    }
+}
+
+#[cfg(not(feature = "capsule"))]
+fn warn_if_sandbox_unavailable(config: &Config, sandbox_override: Option<bool>) {
+    if sandbox_requested(config, sandbox_override) {
+        warn!(
+            "--sandbox requires zeptoPM built with 'capsule' feature (cargo build --features capsule) — running without isolation"
+        );
+    }
+}
+
+#[cfg(feature = "capsule")]
+fn warn_if_sandbox_unavailable(_config: &Config, _sandbox_override: Option<bool>) {}
 
 fn get_run_status_data(
     orchestrator: &OrchestratorEngine,
@@ -1128,4 +1150,32 @@ fn get_runs_list_data(orchestrator: &OrchestratorEngine) -> serde_json::Value {
         })
         .collect();
     serde_json::json!({ "runs": runs })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(isolation: &str) -> Config {
+        Config {
+            daemon: crate::config::DaemonConfig {
+                isolation: isolation.into(),
+                ..crate::config::DaemonConfig::default()
+            },
+            agents: vec![],
+            providers: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_sandbox_requested_uses_config_by_default() {
+        assert!(!sandbox_requested(&test_config("none"), None));
+        assert!(sandbox_requested(&test_config("process"), None));
+    }
+
+    #[test]
+    fn test_sandbox_requested_respects_cli_override() {
+        assert!(sandbox_requested(&test_config("none"), Some(true)));
+        assert!(!sandbox_requested(&test_config("process"), Some(false)));
+    }
 }
