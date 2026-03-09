@@ -80,6 +80,9 @@ pub enum AgentCommand {
         String,
         Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
     ),
+    /// Send a channel-routed message. The response is forwarded back to the
+    /// orchestrator as a `channel_message` event instead of a local reply.
+    ChannelMessage { channel_id: String, message: String },
     /// Execute a job (orchestrator workflow).
     JobExecute {
         job_id: String,
@@ -117,6 +120,21 @@ impl AgentHandle {
         resp_rx
             .await
             .map_err(|_| format!("agent '{}' response channel dropped", self.name))?
+    }
+
+    /// Send a channel-routed message to the agent.
+    pub async fn send_channel_message(
+        &self,
+        channel_id: String,
+        msg: String,
+    ) -> Result<(), String> {
+        self.cmd_tx
+            .send(AgentCommand::ChannelMessage {
+                channel_id,
+                message: msg,
+            })
+            .await
+            .map_err(|_| format!("agent '{}' channel closed", self.name))
     }
 
     /// Send a job_execute command to the agent.
@@ -161,7 +179,7 @@ pub fn spawn_agent(
     config_path: &str,
     state_tx: mpsc::Sender<AgentStateUpdate>,
 ) -> (AgentHandle, tokio::task::JoinHandle<()>) {
-    spawn_agent_with_orch(agent_name, config_path, state_tx, None)
+    spawn_agent_with_orch(agent_name, config_path, state_tx, None, None)
 }
 
 /// Spawn an agent with an optional orchestrator event channel.
@@ -170,6 +188,7 @@ pub fn spawn_agent_with_orch(
     config_path: &str,
     state_tx: mpsc::Sender<AgentStateUpdate>,
     orch_event_tx: Option<mpsc::Sender<serde_json::Value>>,
+    orch_job_id: Option<String>,
 ) -> (AgentHandle, tokio::task::JoinHandle<()>) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<AgentCommand>(64);
 
@@ -184,6 +203,7 @@ pub fn spawn_agent_with_orch(
         cmd_rx,
         state_tx,
         orch_event_tx,
+        orch_job_id,
     ));
 
     (handle, join)
@@ -197,6 +217,7 @@ async fn worker_bridge(
     mut cmd_rx: mpsc::Receiver<AgentCommand>,
     state_tx: mpsc::Sender<AgentStateUpdate>,
     orch_event_tx: Option<mpsc::Sender<serde_json::Value>>,
+    orch_job_id: Option<String>,
 ) {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -293,6 +314,7 @@ async fn worker_bridge(
     // Pending chat requests: id -> oneshot sender
     let mut pending: HashMap<String, tokio::sync::oneshot::Sender<Result<String, String>>> =
         HashMap::new();
+    let mut pending_channel: HashMap<String, String> = HashMap::new();
     let mut req_counter: u64 = 0;
 
     loop {
@@ -308,10 +330,29 @@ async fn worker_bridge(
                   pending.insert(id.clone(), tx);
                 }
 
-                let cmd_json = serde_json::json!({"cmd":"chat","id":id,"message":msg});
+                let mut cmd_json = serde_json::json!({"cmd":"chat","id":id,"message":msg});
+                if let Some(job_id) = &orch_job_id {
+                  cmd_json["job_id"] = serde_json::Value::String(job_id.clone());
+                }
                 let line = format!("{}\n", cmd_json);
                 if stdin_writer.write_all(line.as_bytes()).await.is_err() {
                   warn!(agent = %agent_name, "failed to write to worker stdin");
+                  break;
+                }
+                let _ = stdin_writer.flush().await;
+              }
+              Some(AgentCommand::ChannelMessage { channel_id, message }) => {
+                req_counter += 1;
+                let id = format!("req-{}", req_counter);
+                pending_channel.insert(id.clone(), channel_id);
+
+                let mut cmd_json = serde_json::json!({"cmd":"chat","id":id,"message":message});
+                if let Some(job_id) = &orch_job_id {
+                  cmd_json["job_id"] = serde_json::Value::String(job_id.clone());
+                }
+                let line = format!("{}\n", cmd_json);
+                if stdin_writer.write_all(line.as_bytes()).await.is_err() {
+                  warn!(agent = %agent_name, "failed to write channel message to worker stdin");
                   break;
                 }
                 let _ = stdin_writer.flush().await;
@@ -363,6 +404,25 @@ async fn worker_bridge(
                       } else {
                         let response = msg.get("response").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         let _ = tx.send(Ok(response));
+                      }
+                    } else if let Some(channel_id) = pending_channel.remove(&id) {
+                      if let Some(error) = msg.get("error").and_then(|v| v.as_str()) {
+                        if let (Some(orch_tx), Some(job_id)) = (&orch_event_tx, &orch_job_id) {
+                          let _ = orch_tx.send(serde_json::json!({
+                            "type": "job_failed",
+                            "job_id": job_id,
+                            "error": format!("channel message failed: {}", error),
+                            "retryable": true,
+                          })).await;
+                        }
+                      } else if let (Some(orch_tx), Some(job_id)) = (&orch_event_tx, &orch_job_id) {
+                        let response = msg.get("response").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let _ = orch_tx.send(serde_json::json!({
+                          "type": "channel_message",
+                          "channel_id": channel_id,
+                          "from_job": job_id,
+                          "content": response,
+                        })).await;
                       }
                     }
                   }
@@ -521,5 +581,24 @@ mod tests {
         handle.send_message("hello".into()).await.unwrap();
         let cmd = rx.recv().await.unwrap();
         assert!(matches!(cmd, AgentCommand::UserMessage(ref s, _) if s == "hello"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_handle_send_channel_message() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = AgentHandle {
+            name: "test".into(),
+            cmd_tx: tx,
+        };
+        handle
+            .send_channel_message("run_1:debate".into(), "hello".into())
+            .await
+            .unwrap();
+        let cmd = rx.recv().await.unwrap();
+        assert!(matches!(
+            cmd,
+            AgentCommand::ChannelMessage { ref channel_id, ref message }
+                if channel_id == "run_1:debate" && message == "hello"
+        ));
     }
 }

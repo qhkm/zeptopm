@@ -64,7 +64,10 @@ pub fn validate_plan(plan: &ExecutionPlan) -> Vec<String> {
             errors.push(format!("duplicate channel_id: '{}'", ch.channel_id));
         }
         if ch.participants.is_empty() {
-            errors.push(format!("channel[{}] '{}': no participants", i, ch.channel_id));
+            errors.push(format!(
+                "channel[{}] '{}': no participants",
+                i, ch.channel_id
+            ));
         }
         if ch.mode == ChannelMode::TurnBased && ch.participants.len() < 2 {
             errors.push(format!(
@@ -160,6 +163,7 @@ pub fn materialize_plan(
             current_round: 0,
             current_speaker_idx: 0,
             active: false,
+            closed: false,
             history: vec![],
             initial_message: planned_ch.initial_message.clone(),
         };
@@ -384,7 +388,11 @@ mod tests {
             }],
         };
         let errors = validate_plan(&plan);
-        assert!(errors.iter().any(|e| e.contains("ghost") && e.contains("not found")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("ghost") && e.contains("not found"))
+        );
     }
 
     #[test]
@@ -417,7 +425,11 @@ mod tests {
             ],
         };
         let errors = validate_plan(&plan);
-        assert!(errors.iter().any(|e| e.contains("duplicate") && e.contains("ch1")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("duplicate") && e.contains("ch1"))
+        );
     }
 
     #[test]
@@ -463,7 +475,11 @@ mod tests {
             }],
         };
         let errors = validate_plan(&plan);
-        assert!(errors.iter().any(|e| e.contains("TurnBased") && e.contains("at least 2")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("TurnBased") && e.contains("at least 2"))
+        );
     }
 
     #[test]

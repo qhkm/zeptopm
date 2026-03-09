@@ -80,13 +80,23 @@ impl RunStore {
     }
 
     pub fn list_run_channels(&self, run_id: &str) -> Vec<&Channel> {
-        self.channels.values().filter(|c| c.run_id == run_id).collect()
+        self.channels
+            .values()
+            .filter(|c| c.run_id == run_id)
+            .collect()
     }
 
     pub fn channels_for_job(&self, job_id: &str) -> Vec<&Channel> {
         self.channels
             .values()
             .filter(|c| c.active && c.participants.contains(&job_id.to_string()))
+            .collect()
+    }
+
+    pub fn all_channels_for_job(&self, job_id: &str) -> Vec<&Channel> {
+        self.channels
+            .values()
+            .filter(|c| c.participants.iter().any(|p| p == job_id))
             .collect()
     }
 
@@ -244,6 +254,7 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: false,
+            closed: false,
             history: vec![],
             initial_message: None,
         };
@@ -266,6 +277,7 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: false,
+            closed: false,
             history: vec![],
             initial_message: None,
         };
@@ -282,7 +294,11 @@ mod tests {
         for i in 0..3 {
             store.create_channel(Channel {
                 channel_id: format!("ch_{}", i),
-                run_id: if i < 2 { "run_1".into() } else { "run_2".into() },
+                run_id: if i < 2 {
+                    "run_1".into()
+                } else {
+                    "run_2".into()
+                },
                 participants: vec![],
                 mode: ChannelMode::TurnBased,
                 max_rounds: None,
@@ -290,6 +306,7 @@ mod tests {
                 current_round: 0,
                 current_speaker_idx: 0,
                 active: false,
+                closed: false,
                 history: vec![],
                 initial_message: None,
             });
@@ -311,6 +328,7 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: true,
+            closed: false,
             history: vec![],
             initial_message: None,
         });
@@ -324,6 +342,7 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: true,
+            closed: false,
             history: vec![],
             initial_message: None,
         });
@@ -347,11 +366,33 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: false,
+            closed: false,
             history: vec![],
             initial_message: None,
         });
         store.remove_run("run_1");
         assert!(store.get_channel("ch_1").is_none());
         assert!(store.list_run_channels("run_1").is_empty());
+    }
+
+    #[test]
+    fn test_all_channels_for_job_includes_inactive_channels() {
+        let mut store = RunStore::new();
+        store.create_channel(Channel {
+            channel_id: "ch_1".into(),
+            run_id: "run_1".into(),
+            participants: vec!["job_A".into(), "job_B".into()],
+            mode: ChannelMode::TurnBased,
+            max_rounds: None,
+            on_peer_failure: PeerFailure::KillAll,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: false,
+            closed: false,
+            history: vec![],
+            initial_message: None,
+        });
+
+        assert_eq!(store.all_channels_for_job("job_B").len(), 1);
     }
 }

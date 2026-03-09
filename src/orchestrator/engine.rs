@@ -256,7 +256,7 @@ impl OrchestratorEngine {
                 .store
                 .list_run_channels(run_id)
                 .iter()
-                .filter(|c| !c.active)
+                .filter(|c| !c.active && !c.closed)
                 .map(|c| c.channel_id.clone())
                 .collect();
 
@@ -294,6 +294,18 @@ impl OrchestratorEngine {
                 Some(c) if c.active => c,
                 _ => return ChannelAction::NoOp,
             };
+            if ch.participants.is_empty() || !ch.participants.iter().any(|p| p == from_job) {
+                return ChannelAction::NoOp;
+            }
+            if ch.mode == ChannelMode::TurnBased
+                && ch
+                    .participants
+                    .get(ch.current_speaker_idx)
+                    .map(|p| p.as_str())
+                    != Some(from_job)
+            {
+                return ChannelAction::NoOp;
+            }
             let next_idx = (ch.current_speaker_idx + 1) % ch.participants.len();
             let new_round = if next_idx == 0 {
                 ch.current_round + 1
@@ -326,6 +338,7 @@ impl OrchestratorEngine {
             if new_round >= max {
                 if let Some(ch) = self.store.get_channel_mut(channel_id) {
                     ch.active = false;
+                    ch.closed = true;
                 }
                 return ChannelAction::Close {
                     channel_id: channel_id.into(),
@@ -365,14 +378,22 @@ impl OrchestratorEngine {
     }
 
     /// Handle a channel_done signal from a participant.
-    pub fn handle_channel_done(
-        &mut self,
-        channel_id: &str,
-        _from_job: &str,
-    ) -> ChannelAction {
+    pub fn handle_channel_done(&mut self, channel_id: &str, from_job: &str) -> ChannelAction {
+        {
+            let ch = match self.store.get_channel(channel_id) {
+                Some(c) if c.active => c,
+                _ => return ChannelAction::NoOp,
+            };
+            if !ch.participants.iter().any(|p| p == from_job) {
+                return ChannelAction::NoOp;
+            }
+        }
+
         if let Some(ch) = self.store.get_channel_mut(channel_id) {
             ch.active = false;
+            ch.closed = true;
         }
+
         ChannelAction::Close {
             channel_id: channel_id.into(),
         }
@@ -400,12 +421,11 @@ impl OrchestratorEngine {
 
         if let Some(ch) = self.store.get_channel_mut(channel_id) {
             ch.active = false;
+            ch.closed = true;
         }
 
         match on_failure {
-            PeerFailure::KillAll => {
-                ChannelAction::KillParticipants { job_ids: surviving }
-            }
+            PeerFailure::KillAll => ChannelAction::KillParticipants { job_ids: surviving },
             PeerFailure::Continue => ChannelAction::NotifyPeers {
                 job_ids: surviving,
                 message: format!("peer '{}' disconnected", failed_job),
@@ -833,6 +853,7 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: false,
+            closed: false,
             history: vec![],
             initial_message: None,
         });
@@ -841,6 +862,79 @@ mod tests {
         assert_eq!(activated.len(), 1);
         assert_eq!(activated[0], "ch1");
         assert!(engine.store.get_channel("ch1").unwrap().active);
+    }
+
+    #[test]
+    fn test_activate_ready_channels_skips_closed_channels() {
+        let mut engine = OrchestratorEngine::new(4);
+        let run_id = engine.submit_run("test".into());
+
+        let job_a = gen_id("job");
+        let job_b = gen_id("job");
+        engine.store.create_job(Job {
+            job_id: job_a.clone(),
+            run_id: run_id.clone(),
+            parent_job_id: None,
+            role: "writer".into(),
+            status: JobStatus::Running,
+            instruction: "write".into(),
+            input_artifact_ids: vec![],
+            depends_on: vec![],
+            children: vec![],
+            profile_id: "writer".into(),
+            workspace_dir: std::path::PathBuf::from("/tmp"),
+            attempt: 1,
+            max_attempts: 3,
+            created_at: SystemTime::now(),
+            started_at: Some(SystemTime::now()),
+            finished_at: None,
+            output_artifact_ids: vec![],
+            error: None,
+            revision_round: 0,
+        });
+        engine.store.create_job(Job {
+            job_id: job_b.clone(),
+            run_id: run_id.clone(),
+            parent_job_id: None,
+            role: "reviewer".into(),
+            status: JobStatus::Running,
+            instruction: "review".into(),
+            input_artifact_ids: vec![],
+            depends_on: vec![],
+            children: vec![],
+            profile_id: "reviewer".into(),
+            workspace_dir: std::path::PathBuf::from("/tmp"),
+            attempt: 1,
+            max_attempts: 3,
+            created_at: SystemTime::now(),
+            started_at: Some(SystemTime::now()),
+            finished_at: None,
+            output_artifact_ids: vec![],
+            error: None,
+            revision_round: 0,
+        });
+        engine.active_jobs.insert(job_a.clone(), run_id.clone());
+        engine.active_jobs.insert(job_b.clone(), run_id.clone());
+
+        engine.store.create_channel(Channel {
+            channel_id: "ch1".into(),
+            run_id,
+            participants: vec![job_a, job_b],
+            mode: ChannelMode::TurnBased,
+            max_rounds: Some(1),
+            on_peer_failure: PeerFailure::KillAll,
+            current_round: 1,
+            current_speaker_idx: 0,
+            active: false,
+            closed: true,
+            history: vec![],
+            initial_message: None,
+        });
+
+        assert!(engine.activate_ready_channels().is_empty());
+        let ch = engine.store.get_channel("ch1").unwrap();
+        assert!(!ch.active);
+        assert!(ch.closed);
     }
 
     #[test]
@@ -857,13 +951,13 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: true,
+            closed: false,
             history: vec![],
             initial_message: None,
         };
         engine.store.create_channel(ch);
 
-        let action =
-            engine.route_channel_message("ch1", "job_A", "Here is my draft");
+        let action = engine.route_channel_message("ch1", "job_A", "Here is my draft");
         match action {
             ChannelAction::SendTo { job_id, message } => {
                 assert_eq!(job_id, "job_B");
@@ -891,6 +985,7 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: true,
+            closed: false,
             history: vec![],
             initial_message: None,
         };
@@ -899,18 +994,14 @@ mod tests {
         // A speaks (round 0, speaker 0 -> speaker 1)
         let _ = engine.route_channel_message("ch1", "job_A", "draft");
         // B speaks (round 0, speaker 1 -> round 1, speaker 0) — hits max_rounds
-        let action =
-            engine.route_channel_message("ch1", "job_B", "looks good");
+        let action = engine.route_channel_message("ch1", "job_B", "looks good");
 
         match action {
             ChannelAction::Close { channel_id } => {
                 assert_eq!(channel_id, "ch1");
             }
             _ => {
-                panic!(
-                    "expected Close after max_rounds reached, got {:?}",
-                    action
-                )
+                panic!("expected Close after max_rounds reached, got {:?}", action)
             }
         }
     }
@@ -929,6 +1020,7 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: true,
+            closed: false,
             history: vec![],
             initial_message: None,
         };
@@ -945,6 +1037,30 @@ mod tests {
     }
 
     #[test]
+    fn test_channel_done_rejects_non_participant() {
+        let mut engine = OrchestratorEngine::new(4);
+
+        engine.store.create_channel(Channel {
+            channel_id: "ch1".into(),
+            run_id: "run_1".into(),
+            participants: vec!["job_A".into(), "job_B".into()],
+            mode: ChannelMode::TurnBased,
+            max_rounds: None,
+            on_peer_failure: PeerFailure::KillAll,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: true,
+            closed: false,
+            history: vec![],
+            initial_message: None,
+        });
+
+        let action = engine.handle_channel_done("ch1", "intruder");
+        assert!(matches!(action, ChannelAction::NoOp));
+        assert!(engine.store.get_channel("ch1").unwrap().active);
+    }
+
+    #[test]
     fn test_peer_failure_kill_all() {
         let mut engine = OrchestratorEngine::new(4);
 
@@ -958,13 +1074,13 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: true,
+            closed: false,
             history: vec![],
             initial_message: None,
         };
         engine.store.create_channel(ch);
 
-        let action =
-            engine.handle_channel_peer_failure("ch1", "job_A");
+        let action = engine.handle_channel_peer_failure("ch1", "job_A");
         match action {
             ChannelAction::KillParticipants { job_ids } => {
                 assert!(job_ids.contains(&"job_B".to_string()));
@@ -987,13 +1103,13 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: true,
+            closed: false,
             history: vec![],
             initial_message: None,
         };
         engine.store.create_channel(ch);
 
-        let action =
-            engine.handle_channel_peer_failure("ch1", "job_A");
+        let action = engine.handle_channel_peer_failure("ch1", "job_A");
         match action {
             ChannelAction::NotifyPeers { job_ids, message } => {
                 assert!(job_ids.contains(&"job_B".to_string()));
@@ -1017,6 +1133,7 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: true,
+            closed: false,
             history: vec![],
             initial_message: None,
         };
@@ -1046,6 +1163,7 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: true,
+            closed: false,
             history: vec![],
             initial_message: None,
         };
@@ -1059,8 +1177,68 @@ mod tests {
                 assert!(job_ids.contains(&"sink_b".to_string()));
                 assert!(message.contains("data chunk"));
             }
-            _ => panic!("expected Broadcast for 3-participant stream, got {:?}", action),
+            _ => panic!(
+                "expected Broadcast for 3-participant stream, got {:?}",
+                action
+            ),
         }
+    }
+
+    #[test]
+    fn test_turn_based_rejects_out_of_turn_sender() {
+        let mut engine = OrchestratorEngine::new(4);
+
+        engine.store.create_channel(Channel {
+            channel_id: "debate".into(),
+            run_id: "run_1".into(),
+            participants: vec!["job_A".into(), "job_B".into()],
+            mode: ChannelMode::TurnBased,
+            max_rounds: None,
+            on_peer_failure: PeerFailure::KillAll,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: true,
+            closed: false,
+            history: vec![],
+            initial_message: None,
+        });
+
+        let action = engine.route_channel_message("debate", "job_B", "jumping ahead");
+        assert!(matches!(action, ChannelAction::NoOp));
+        let ch = engine.store.get_channel("debate").unwrap();
+        assert_eq!(ch.current_speaker_idx, 0);
+        assert!(ch.history.is_empty());
+    }
+
+    #[test]
+    fn test_stream_rejects_non_participant_sender() {
+        let mut engine = OrchestratorEngine::new(4);
+
+        engine.store.create_channel(Channel {
+            channel_id: "stream".into(),
+            run_id: "run_1".into(),
+            participants: vec!["job_A".into(), "job_B".into()],
+            mode: ChannelMode::Stream,
+            max_rounds: None,
+            on_peer_failure: PeerFailure::Continue,
+            current_round: 0,
+            current_speaker_idx: 0,
+            active: true,
+            closed: false,
+            history: vec![],
+            initial_message: None,
+        });
+
+        let action = engine.route_channel_message("stream", "intruder", "forged");
+        assert!(matches!(action, ChannelAction::NoOp));
+        assert!(
+            engine
+                .store
+                .get_channel("stream")
+                .unwrap()
+                .history
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1124,6 +1302,7 @@ mod tests {
             current_round: 0,
             current_speaker_idx: 0,
             active: false,
+            closed: false,
             history: vec![],
             initial_message: None,
         });

@@ -117,6 +117,10 @@ pub async fn run(agent_name: String, config_path: String) {
                     .and_then(|v| v.as_str())
                     .unwrap_or("0")
                     .to_string();
+                let job_id = cmd
+                    .get("job_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let message = cmd
                     .get("message")
                     .and_then(|v| v.as_str())
@@ -126,8 +130,24 @@ pub async fn run(agent_name: String, config_path: String) {
                 send_status("running", None);
                 send_log("info", "processing message");
 
+                let heartbeat_handle = job_id.as_ref().map(|job_id| {
+                    let hb_job_id = job_id.clone();
+                    tokio::spawn(async move {
+                        let mut interval =
+                            tokio::time::interval(std::time::Duration::from_secs(10));
+                        interval.tick().await;
+                        loop {
+                            interval.tick().await;
+                            send_heartbeat(&hb_job_id, "running");
+                        }
+                    })
+                });
+
                 match agent.chat(&message).await {
                     Ok(response) => {
+                        if let Some(handle) = &heartbeat_handle {
+                            handle.abort();
+                        }
                         send(&serde_json::json!({
                           "type": "chat_response",
                           "id": id,
@@ -136,6 +156,9 @@ pub async fn run(agent_name: String, config_path: String) {
                         send_log("info", "response delivered");
                     }
                     Err(e) => {
+                        if let Some(handle) = &heartbeat_handle {
+                            handle.abort();
+                        }
                         send(&serde_json::json!({
                           "type": "chat_response",
                           "id": id,

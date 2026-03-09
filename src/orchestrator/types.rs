@@ -112,6 +112,8 @@ pub struct Channel {
     pub current_round: u32,
     pub current_speaker_idx: usize,
     pub active: bool,
+    #[serde(default)]
+    pub closed: bool,
     pub history: Vec<ChannelMessage>,
     pub initial_message: Option<String>,
 }
@@ -131,11 +133,24 @@ pub struct PlannedChannel {
 
 #[derive(Debug, Clone)]
 pub enum ChannelAction {
-    SendTo { job_id: JobId, message: String },
-    Broadcast { job_ids: Vec<JobId>, message: String },
-    Close { channel_id: ChannelId },
-    KillParticipants { job_ids: Vec<JobId> },
-    NotifyPeers { job_ids: Vec<JobId>, message: String },
+    SendTo {
+        job_id: JobId,
+        message: String,
+    },
+    Broadcast {
+        job_ids: Vec<JobId>,
+        message: String,
+    },
+    Close {
+        channel_id: ChannelId,
+    },
+    KillParticipants {
+        job_ids: Vec<JobId>,
+    },
+    NotifyPeers {
+        job_ids: Vec<JobId>,
+        message: String,
+    },
     NoOp,
 }
 

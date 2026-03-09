@@ -261,7 +261,11 @@ pub fn spawn_capsule_job(
                             let _ = capsule.kill(Signal::Kill);
                             break;
                         }
-                        Some(AgentCommand::UserMessage(..) | AgentCommand::JobExecute { .. }) => {}
+                        Some(
+                            AgentCommand::UserMessage(..)
+                            | AgentCommand::ChannelMessage { .. }
+                            | AgentCommand::JobExecute { .. }
+                        ) => {}
                     }
                 }
                 line = reader.next_line() => {

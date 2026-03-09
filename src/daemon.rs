@@ -21,15 +21,20 @@ macro_rules! activate_channels {
         for ch_id in &activated_channels {
             info!(channel_id = %ch_id, "channel activated — all participants running");
             if let Some(ch) = $orchestrator.store.get_channel(ch_id) {
-                if let Some(ref initial_msg) = ch.initial_message {
+                if ch.history.is_empty() {
+                    if let Some(ref initial_msg) = ch.initial_message {
                     let first_job = ch.participants.first().cloned();
                     if let Some(job_id) = first_job {
                         let worker_name = format!("__job_{}", job_id);
                         if let Some(internal) = $managed.get(&worker_name) {
                             info!(channel = %ch_id, to = %job_id, "sending initial channel message");
-                            let _ = internal.handle.send_message(initial_msg.clone()).await;
+                            let _ = internal
+                                .handle
+                                .send_channel_message(ch_id.clone(), initial_msg.clone())
+                                .await;
                         }
                     }
+                }
                 }
             }
         }
@@ -189,6 +194,14 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
         if let Ok(artifacts) = db.load_artifacts() {
             for artifact in artifacts {
                 orchestrator.store.create_artifact(artifact);
+            }
+        }
+        if let Ok(channels) = db.load_channels() {
+            for mut channel in channels {
+                if !channel.closed {
+                    channel.active = false;
+                }
+                orchestrator.store.create_channel(channel);
             }
         }
 
@@ -584,6 +597,11 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                 let channel_id = event.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
                 let from_job = event.get("from_job").and_then(|v| v.as_str()).unwrap_or("");
                 let content = event.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let run_id = orchestrator
+                    .store
+                    .get_channel(channel_id)
+                    .map(|ch| ch.run_id.clone())
+                    .unwrap_or_default();
 
                 let action = orchestrator.route_channel_message(channel_id, from_job, content);
                 match action {
@@ -591,7 +609,10 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                         let worker_name = format!("__job_{}", job_id);
                         if let Some(internal) = managed.get(&worker_name) {
                             info!(channel = %channel_id, to = %job_id, "routing channel message");
-                            let _ = internal.handle.send_message(message).await;
+                            let _ = internal
+                                .handle
+                                .send_channel_message(channel_id.to_string(), message)
+                                .await;
                         }
                     }
                     crate::orchestrator::types::ChannelAction::Broadcast { job_ids, message } => {
@@ -599,21 +620,69 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                             let worker_name = format!("__job_{}", target_id);
                             if let Some(internal) = managed.get(&worker_name) {
                                 info!(channel = %channel_id, to = %target_id, "broadcasting channel message");
-                                let _ = internal.handle.send_message(message.clone()).await;
+                                let _ = internal
+                                    .handle
+                                    .send_channel_message(channel_id.to_string(), message.clone())
+                                    .await;
                             }
                         }
                     }
                     crate::orchestrator::types::ChannelAction::Close { channel_id } => {
                         info!(channel = %channel_id, "channel closed — max rounds or done");
+                        complete_closed_channel_participants(&mut orchestrator, &mut managed, db.as_ref(), &channel_id).await;
                     }
                     _ => {}
+                }
+
+                while let Some(job) = orchestrator.next_job() {
+                  info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
+                  orchestrator.mark_running(&job.job_id);
+                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
+                }
+
+                activate_channels!(orchestrator, managed);
+
+                if let Some(ref db) = db {
+                  db.persist_run_state(&orchestrator.store, &run_id).ok();
                 }
               }
               "channel_done" => {
                 let channel_id = event.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
                 let from_job = event.get("from_job").and_then(|v| v.as_str()).unwrap_or("");
-                let _action = orchestrator.handle_channel_done(channel_id, from_job);
-                info!(channel = %channel_id, from = %from_job, "channel_done signal received");
+                let run_id = orchestrator
+                    .store
+                    .get_channel(channel_id)
+                    .map(|ch| ch.run_id.clone())
+                    .unwrap_or_default();
+                let action = orchestrator.handle_channel_done(channel_id, from_job);
+                match action {
+                    crate::orchestrator::types::ChannelAction::Close { .. } => {
+                        complete_closed_channel_participants(
+                            &mut orchestrator,
+                            &mut managed,
+                            db.as_ref(),
+                            channel_id,
+                        )
+                        .await;
+                        info!(channel = %channel_id, from = %from_job, "channel_done signal received");
+                    }
+                    crate::orchestrator::types::ChannelAction::NoOp => {
+                        warn!(channel = %channel_id, from = %from_job, "ignored invalid channel_done");
+                    }
+                    _ => {}
+                }
+
+                while let Some(job) = orchestrator.next_job() {
+                  info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
+                  orchestrator.mark_running(&job.job_id);
+                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
+                }
+
+                activate_channels!(orchestrator, managed);
+
+                if let Some(ref db) = db {
+                  db.persist_run_state(&orchestrator.store, &run_id).ok();
+                }
               }
               "artifact_produced" => {
                 let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -649,6 +718,29 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                 current_config = new_config;
                 last_config_hash = new_hash;
                 warn_if_sandbox_unavailable(&current_config, sandbox_override);
+              }
+            }
+
+            // Channel jobs can wait idle between routed turns for longer than
+            // the normal stale-job timeout. Refresh heartbeats only while the
+            // worker is idle and still participating in an open channel.
+            let active_job_ids: Vec<String> = orchestrator.active_jobs.keys().cloned().collect();
+            for job_id in active_job_ids {
+              let worker_name = format!("__job_{}", job_id);
+              let should_refresh = managed.get(&worker_name)
+                .map(|internal| {
+                  internal.supports_direct_chat
+                    && internal.state.status == AgentStatus::Idle
+                    && orchestrator.store.get_job(&job_id)
+                      .map(|job| job.status == crate::orchestrator::types::JobStatus::Running)
+                      .unwrap_or(false)
+                    && orchestrator.store.all_channels_for_job(&job_id)
+                      .iter()
+                      .any(|ch| !ch.closed)
+                })
+                .unwrap_or(false);
+              if should_refresh {
+                orchestrator.record_heartbeat(&job_id);
               }
             }
 
@@ -796,6 +888,7 @@ struct InternalAgent {
     restart_backoff_ms: u64,
     restart_at: Option<Instant>,
     gateway: Option<ResolvedGatewayConfig>,
+    supports_direct_chat: bool,
 }
 
 async fn sync_agent_to_shared(shared: &SharedState, name: &str, internal: &InternalAgent) {
@@ -845,6 +938,7 @@ fn spawn_managed_agent(
         restart_backoff_ms: agent_config.restart_backoff_ms,
         restart_at: None,
         gateway,
+        supports_direct_chat: true,
     })
 }
 
@@ -899,6 +993,211 @@ async fn apply_config_changes(
     }
 }
 
+fn build_channel_job_setup_prompt(
+    job: &crate::orchestrator::types::Job,
+    input_artifacts: &[String],
+) -> String {
+    let mut prompt = format!(
+        "You are executing orchestrated job '{}'.\nRole: {}\nInstruction: {}\nWorkspace: {}\n\nYou may receive routed messages from peer agents through the orchestrator. Wait for the next routed message before doing substantive work.",
+        job.job_id,
+        job.role,
+        job.instruction,
+        job.workspace_dir.display(),
+    );
+    if !input_artifacts.is_empty() {
+        prompt.push_str("\n\nInput artifact paths:");
+        for path in input_artifacts {
+            prompt.push_str(&format!("\n- {}", path));
+        }
+    }
+    prompt.push_str("\n\nReply with a brief ACK only.");
+    prompt
+}
+
+fn collect_job_channels(
+    orchestrator: &OrchestratorEngine,
+    job_id: &str,
+) -> Option<(
+    crate::orchestrator::types::Job,
+    Vec<crate::orchestrator::types::Channel>,
+)> {
+    let job = orchestrator.store.get_job(job_id).cloned()?;
+    let channels: Vec<crate::orchestrator::types::Channel> = orchestrator
+        .store
+        .all_channels_for_job(job_id)
+        .into_iter()
+        .cloned()
+        .collect();
+    if channels.is_empty() {
+        None
+    } else {
+        Some((job, channels))
+    }
+}
+
+fn build_channel_completion_prompt(
+    job: &crate::orchestrator::types::Job,
+    channels: &[crate::orchestrator::types::Channel],
+) -> String {
+    let mut prompt = format!(
+        "You are finishing orchestrated job '{}'.\nRole: {}\nInstruction: {}\n\nProduce the final best answer for your job based on the channel discussion. Respond only with the final deliverable content, not an explanation of your process.",
+        job.job_id, job.role, job.instruction
+    );
+    for channel in channels {
+        prompt.push_str(&format!(
+            "\n\nChannel {} ({:?}):",
+            channel.channel_id, channel.mode
+        ));
+        if channel.history.is_empty() {
+            prompt.push_str("\n- No routed messages were captured.");
+            continue;
+        }
+        for msg in &channel.history {
+            prompt.push_str(&format!(
+                "\n- {} [round {}]: {}",
+                msg.from_job, msg.round, msg.content
+            ));
+        }
+    }
+    prompt
+}
+
+fn build_channel_artifact_content(
+    job: &crate::orchestrator::types::Job,
+    channels: &[crate::orchestrator::types::Channel],
+    final_response: Option<&str>,
+) -> String {
+    let mut content = String::new();
+    if let Some(final_response) = final_response {
+        content.push_str(final_response.trim());
+        content.push_str("\n\n---\n\n");
+    }
+    content.push_str(&format!(
+        "# Channel Output\n\nJob ID: {}\nRole: {}\nInstruction: {}\n",
+        job.job_id, job.role, job.instruction
+    ));
+
+    for channel in channels {
+        content.push_str(&format!(
+            "\n## Channel {}\nMode: {:?}\n",
+            channel.channel_id, channel.mode
+        ));
+        if channel.history.is_empty() {
+            content.push_str("\nNo routed messages were captured.\n");
+            continue;
+        }
+
+        for msg in &channel.history {
+            content.push_str(&format!(
+                "\n### {} (round {})\n{}\n",
+                msg.from_job, msg.round, msg.content
+            ));
+        }
+    }
+
+    content
+}
+
+fn persist_channel_artifact(
+    orchestrator: &mut OrchestratorEngine,
+    job: &crate::orchestrator::types::Job,
+    content: String,
+    db: Option<&crate::orchestrator::sqlite_store::SqlitePersistence>,
+) -> Vec<String> {
+    let artifact_id = crate::orchestrator::scheduler::gen_id("art");
+    let artifact_path = job.workspace_dir.join("channel-output.md");
+    if std::fs::write(&artifact_path, &content).is_err() {
+        return vec![];
+    }
+
+    let artifact = crate::orchestrator::types::Artifact {
+        artifact_id: artifact_id.clone(),
+        run_id: job.run_id.clone(),
+        job_id: job.job_id.clone(),
+        kind: "markdown".into(),
+        path: artifact_path,
+        summary: content.chars().take(200).collect(),
+        created_at: std::time::SystemTime::now(),
+    };
+    orchestrator.store.create_artifact(artifact.clone());
+    if let Some(db) = db {
+        db.persist_artifact(&artifact).ok();
+    }
+
+    vec![artifact_id]
+}
+
+fn synthesize_channel_artifact(
+    orchestrator: &mut OrchestratorEngine,
+    job_id: &str,
+    final_response: Option<&str>,
+    db: Option<&crate::orchestrator::sqlite_store::SqlitePersistence>,
+) -> Vec<String> {
+    let Some((job, channels)) = collect_job_channels(orchestrator, job_id) else {
+        return vec![];
+    };
+
+    std::fs::create_dir_all(&job.workspace_dir).ok();
+    let content = build_channel_artifact_content(&job, &channels, final_response);
+    persist_channel_artifact(orchestrator, &job, content, db)
+}
+
+async fn complete_closed_channel_participants(
+    orchestrator: &mut OrchestratorEngine,
+    managed: &mut HashMap<String, InternalAgent>,
+    db: Option<&crate::orchestrator::sqlite_store::SqlitePersistence>,
+    channel_id: &str,
+) {
+    let Some(channel) = orchestrator.store.get_channel(channel_id).cloned() else {
+        return;
+    };
+
+    for job_id in &channel.participants {
+        let still_has_open_channels = orchestrator
+            .store
+            .all_channels_for_job(job_id)
+            .iter()
+            .any(|ch| ch.channel_id != channel_id && !ch.closed);
+        let is_running = orchestrator
+            .store
+            .get_job(job_id)
+            .map(|job| job.status == crate::orchestrator::types::JobStatus::Running)
+            .unwrap_or(false);
+
+        if is_running && !still_has_open_channels {
+            let worker_name = format!("__job_{}", job_id);
+            let completion_prompt = collect_job_channels(orchestrator, job_id)
+                .map(|(job, channels)| build_channel_completion_prompt(&job, &channels));
+            let final_response = if let (Some(internal), Some(prompt)) =
+                (managed.get(&worker_name), completion_prompt)
+            {
+                if internal.supports_direct_chat {
+                    match tokio::time::timeout(
+                        Duration::from_secs(45),
+                        internal.handle.chat(prompt),
+                    )
+                    .await
+                    {
+                        Ok(Ok(response)) if !response.trim().is_empty() => Some(response),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(internal) = managed.remove(&worker_name) {
+                internal.handle.stop().await;
+            }
+            let artifact_ids =
+                synthesize_channel_artifact(orchestrator, job_id, final_response.as_deref(), db);
+            orchestrator.mark_completed(job_id, artifact_ids);
+        }
+    }
+}
+
 /// Spawn a temporary worker process for an orchestration job.
 ///
 /// When sandboxing is active, uses ZeptoKernel capsule isolation.
@@ -940,6 +1239,7 @@ async fn spawn_job_worker(
                 restart_backoff_ms: 1000,
                 restart_at: None,
                 gateway: None,
+                supports_direct_chat: false,
             },
         );
         return;
@@ -968,6 +1268,7 @@ async fn spawn_job_worker(
         config_path,
         state_tx.clone(),
         Some(orch_event_tx.clone()),
+        Some(job.job_id.clone()),
     );
 
     // Collect input artifact paths from completed dependencies
@@ -978,15 +1279,26 @@ async fn spawn_job_worker(
         .map(|a| a.path.to_string_lossy().to_string())
         .collect();
 
-    // Send job_execute command — the worker will emit job_completed/job_failed events
-    let _ = handle
-        .send_job(
-            job.job_id.clone(),
-            job.instruction.clone(),
-            job.workspace_dir.to_string_lossy().to_string(),
-            input_artifacts,
-        )
-        .await;
+    let participates_in_channels = !orchestrator_store
+        .all_channels_for_job(&job.job_id)
+        .is_empty();
+
+    std::fs::create_dir_all(&job.workspace_dir).ok();
+
+    if participates_in_channels {
+        let setup_prompt = build_channel_job_setup_prompt(job, &input_artifacts);
+        let _ = handle.send_message(setup_prompt).await;
+    } else {
+        // Send job_execute command — the worker will emit job_completed/job_failed events
+        let _ = handle
+            .send_job(
+                job.job_id.clone(),
+                job.instruction.clone(),
+                job.workspace_dir.to_string_lossy().to_string(),
+                input_artifacts,
+            )
+            .await;
+    }
 
     // Store the handle to keep the bridge alive until the job completes.
     // Using a unique name to avoid collisions with regular agents.
@@ -1011,6 +1323,7 @@ async fn spawn_job_worker(
             restart_backoff_ms: 1000,
             restart_at: None,
             gateway: None,
+            supports_direct_chat: true,
         },
     );
 }
@@ -1297,5 +1610,213 @@ mod tests {
     fn test_sandbox_requested_respects_cli_override() {
         assert!(sandbox_requested(&test_config("none"), Some(true)));
         assert!(!sandbox_requested(&test_config("process"), Some(false)));
+    }
+
+    #[test]
+    fn test_synthesize_channel_artifact_from_history() {
+        let mut orchestrator = OrchestratorEngine::new(4);
+        let temp_root =
+            std::env::temp_dir().join(crate::orchestrator::scheduler::gen_id("daemon-test"));
+        let workspace = temp_root.join("job_1");
+
+        orchestrator
+            .store
+            .create_run(crate::orchestrator::types::Run {
+                run_id: "run_1".into(),
+                task: "test".into(),
+                status: crate::orchestrator::types::RunStatus::Running,
+                created_at: std::time::SystemTime::now(),
+                updated_at: std::time::SystemTime::now(),
+                root_job_id: "job_1".into(),
+                final_artifact_ids: vec![],
+                metadata: HashMap::new(),
+            });
+        orchestrator
+            .store
+            .create_job(crate::orchestrator::types::Job {
+                job_id: "job_1".into(),
+                run_id: "run_1".into(),
+                parent_job_id: None,
+                role: "writer".into(),
+                status: crate::orchestrator::types::JobStatus::Running,
+                instruction: "Write with peer input".into(),
+                input_artifact_ids: vec![],
+                depends_on: vec![],
+                children: vec![],
+                profile_id: "writer".into(),
+                workspace_dir: workspace.clone(),
+                attempt: 1,
+                max_attempts: 3,
+                created_at: std::time::SystemTime::now(),
+                started_at: Some(std::time::SystemTime::now()),
+                finished_at: None,
+                output_artifact_ids: vec![],
+                error: None,
+                revision_round: 0,
+            });
+        orchestrator
+            .store
+            .create_channel(crate::orchestrator::types::Channel {
+                channel_id: "run_1:debate".into(),
+                run_id: "run_1".into(),
+                participants: vec!["job_1".into(), "job_2".into()],
+                mode: crate::orchestrator::types::ChannelMode::TurnBased,
+                max_rounds: Some(2),
+                on_peer_failure: crate::orchestrator::types::PeerFailure::KillAll,
+                current_round: 1,
+                current_speaker_idx: 0,
+                active: false,
+                closed: false,
+                history: vec![crate::orchestrator::types::ChannelMessage {
+                    from_job: "job_2".into(),
+                    content: "Please revise the intro".into(),
+                    timestamp: std::time::SystemTime::now(),
+                    round: 0,
+                }],
+                initial_message: Some("Draft the post".into()),
+            });
+
+        let artifact_ids = synthesize_channel_artifact(&mut orchestrator, "job_1", None, None);
+        assert_eq!(artifact_ids.len(), 1);
+
+        let artifact = orchestrator.store.get_artifact(&artifact_ids[0]).unwrap();
+        let content = std::fs::read_to_string(&artifact.path).unwrap();
+        assert!(content.contains("Please revise the intro"));
+        assert!(content.contains("run_1:debate"));
+
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn test_channel_artifact_content_includes_final_response() {
+        let job = crate::orchestrator::types::Job {
+            job_id: "job_1".into(),
+            run_id: "run_1".into(),
+            parent_job_id: None,
+            role: "writer".into(),
+            status: crate::orchestrator::types::JobStatus::Running,
+            instruction: "Write with peer input".into(),
+            input_artifact_ids: vec![],
+            depends_on: vec![],
+            children: vec![],
+            profile_id: "writer".into(),
+            workspace_dir: std::path::PathBuf::from("/tmp/job_1"),
+            attempt: 1,
+            max_attempts: 3,
+            created_at: std::time::SystemTime::now(),
+            started_at: Some(std::time::SystemTime::now()),
+            finished_at: None,
+            output_artifact_ids: vec![],
+            error: None,
+            revision_round: 0,
+        };
+        let channels = vec![crate::orchestrator::types::Channel {
+            channel_id: "run_1:debate".into(),
+            run_id: "run_1".into(),
+            participants: vec!["job_1".into(), "job_2".into()],
+            mode: crate::orchestrator::types::ChannelMode::TurnBased,
+            max_rounds: Some(2),
+            on_peer_failure: crate::orchestrator::types::PeerFailure::KillAll,
+            current_round: 1,
+            current_speaker_idx: 0,
+            active: false,
+            closed: false,
+            history: vec![crate::orchestrator::types::ChannelMessage {
+                from_job: "job_2".into(),
+                content: "Please revise the intro".into(),
+                timestamp: std::time::SystemTime::now(),
+                round: 0,
+            }],
+            initial_message: Some("Draft the post".into()),
+        }];
+
+        let content =
+            build_channel_artifact_content(&job, &channels, Some("Final polished answer"));
+        assert!(content.starts_with("Final polished answer"));
+        assert!(content.contains("# Channel Output"));
+    }
+
+    #[tokio::test]
+    async fn test_complete_closed_channel_participants_waits_for_future_channels() {
+        let mut orchestrator = OrchestratorEngine::new(4);
+        orchestrator
+            .store
+            .create_run(crate::orchestrator::types::Run {
+                run_id: "run_1".into(),
+                task: "test".into(),
+                status: crate::orchestrator::types::RunStatus::Running,
+                created_at: std::time::SystemTime::now(),
+                updated_at: std::time::SystemTime::now(),
+                root_job_id: "job_1".into(),
+                final_artifact_ids: vec![],
+                metadata: HashMap::new(),
+            });
+        orchestrator
+            .store
+            .create_job(crate::orchestrator::types::Job {
+                job_id: "job_1".into(),
+                run_id: "run_1".into(),
+                parent_job_id: None,
+                role: "writer".into(),
+                status: crate::orchestrator::types::JobStatus::Running,
+                instruction: "Write with peer input".into(),
+                input_artifact_ids: vec![],
+                depends_on: vec![],
+                children: vec![],
+                profile_id: "writer".into(),
+                workspace_dir: std::env::temp_dir().join("job_1"),
+                attempt: 1,
+                max_attempts: 3,
+                created_at: std::time::SystemTime::now(),
+                started_at: Some(std::time::SystemTime::now()),
+                finished_at: None,
+                output_artifact_ids: vec![],
+                error: None,
+                revision_round: 0,
+            });
+        orchestrator
+            .store
+            .create_channel(crate::orchestrator::types::Channel {
+                channel_id: "run_1:phase_one".into(),
+                run_id: "run_1".into(),
+                participants: vec!["job_1".into(), "job_2".into()],
+                mode: crate::orchestrator::types::ChannelMode::TurnBased,
+                max_rounds: Some(1),
+                on_peer_failure: crate::orchestrator::types::PeerFailure::KillAll,
+                current_round: 1,
+                current_speaker_idx: 0,
+                active: false,
+                closed: true,
+                history: vec![],
+                initial_message: None,
+            });
+        orchestrator
+            .store
+            .create_channel(crate::orchestrator::types::Channel {
+                channel_id: "run_1:phase_two".into(),
+                run_id: "run_1".into(),
+                participants: vec!["job_1".into(), "job_3".into()],
+                mode: crate::orchestrator::types::ChannelMode::TurnBased,
+                max_rounds: Some(1),
+                on_peer_failure: crate::orchestrator::types::PeerFailure::KillAll,
+                current_round: 0,
+                current_speaker_idx: 0,
+                active: false,
+                closed: false,
+                history: vec![],
+                initial_message: None,
+            });
+
+        let mut managed = HashMap::new();
+        complete_closed_channel_participants(
+            &mut orchestrator,
+            &mut managed,
+            None,
+            "run_1:phase_one",
+        )
+        .await;
+
+        let job = orchestrator.store.get_job("job_1").unwrap();
+        assert_eq!(job.status, crate::orchestrator::types::JobStatus::Running);
     }
 }

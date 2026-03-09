@@ -82,6 +82,21 @@ impl SqlitePersistence {
                 path TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 created_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                participants TEXT NOT NULL DEFAULT '[]',
+                mode TEXT NOT NULL,
+                max_rounds INTEGER,
+                on_peer_failure TEXT NOT NULL,
+                current_round INTEGER NOT NULL DEFAULT 0,
+                current_speaker_idx INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 0,
+                closed INTEGER NOT NULL DEFAULT 0,
+                history TEXT NOT NULL DEFAULT '[]',
+                initial_message TEXT
             );",
         )?;
 
@@ -171,6 +186,30 @@ impl SqlitePersistence {
         Ok(())
     }
 
+    pub fn persist_channel(&self, channel: &Channel) -> Result<(), rusqlite::Error> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO channels
+             (channel_id, run_id, participants, mode, max_rounds, on_peer_failure,
+              current_round, current_speaker_idx, active, closed, history, initial_message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                channel.channel_id,
+                channel.run_id,
+                serde_json::to_string(&channel.participants).unwrap_or_default(),
+                format!("{:?}", channel.mode),
+                channel.max_rounds,
+                format!("{:?}", channel.on_peer_failure),
+                channel.current_round,
+                channel.current_speaker_idx as i64,
+                channel.active as i64,
+                channel.closed as i64,
+                serde_json::to_string(&channel.history).unwrap_or_default(),
+                channel.initial_message,
+            ],
+        )?;
+        Ok(())
+    }
+
     // --- Load operations (for hydration on startup) ---
 
     pub fn load_runs(&self) -> Result<Vec<Run>, rusqlite::Error> {
@@ -252,6 +291,33 @@ impl SqlitePersistence {
         Ok(artifacts)
     }
 
+    pub fn load_channels(&self) -> Result<Vec<Channel>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT channel_id, run_id, participants, mode, max_rounds, on_peer_failure,
+                    current_round, current_speaker_idx, active, closed, history, initial_message
+             FROM channels",
+        )?;
+        let channels = stmt
+            .query_map([], |row| {
+                Ok(Channel {
+                    channel_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    participants: parse_json_vec(&row.get::<_, String>(2)?),
+                    mode: parse_channel_mode(&row.get::<_, String>(3)?),
+                    max_rounds: row.get(4)?,
+                    on_peer_failure: parse_peer_failure(&row.get::<_, String>(5)?),
+                    current_round: row.get(6)?,
+                    current_speaker_idx: row.get::<_, i64>(7)? as usize,
+                    active: row.get::<_, i64>(8)? != 0,
+                    closed: row.get::<_, i64>(9)? != 0,
+                    history: parse_json_channel_messages(&row.get::<_, String>(10)?),
+                    initial_message: row.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(channels)
+    }
+
     /// Persist all jobs and the run for a given run_id (bulk persist after mutations).
     pub fn persist_run_state(
         &self,
@@ -264,6 +330,9 @@ impl SqlitePersistence {
         for job in store.list_run_jobs(run_id) {
             self.persist_job(job)?;
         }
+        for channel in store.list_run_channels(run_id) {
+            self.persist_channel(channel)?;
+        }
         Ok(())
     }
 
@@ -273,6 +342,8 @@ impl SqlitePersistence {
             .execute("DELETE FROM artifacts WHERE run_id = ?1", params![run_id])?;
         self.conn
             .execute("DELETE FROM jobs WHERE run_id = ?1", params![run_id])?;
+        self.conn
+            .execute("DELETE FROM channels WHERE run_id = ?1", params![run_id])?;
         self.conn
             .execute("DELETE FROM runs WHERE run_id = ?1", params![run_id])?;
         Ok(())
@@ -314,7 +385,27 @@ fn parse_job_status(s: &str) -> JobStatus {
     }
 }
 
+fn parse_channel_mode(s: &str) -> ChannelMode {
+    match s {
+        "TurnBased" => ChannelMode::TurnBased,
+        "Stream" => ChannelMode::Stream,
+        _ => ChannelMode::TurnBased,
+    }
+}
+
+fn parse_peer_failure(s: &str) -> PeerFailure {
+    match s {
+        "Continue" => PeerFailure::Continue,
+        "KillAll" => PeerFailure::KillAll,
+        _ => PeerFailure::KillAll,
+    }
+}
+
 fn parse_json_vec(s: &str) -> Vec<String> {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
+fn parse_json_channel_messages(s: &str) -> Vec<ChannelMessage> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
@@ -361,6 +452,28 @@ mod tests {
             finished_at: None,
             output_artifact_ids: vec![],
             error: None,
+        }
+    }
+
+    fn make_test_channel() -> Channel {
+        Channel {
+            channel_id: "run_1:debate".into(),
+            run_id: "run_1".into(),
+            participants: vec!["job_1".into(), "job_2".into()],
+            mode: ChannelMode::TurnBased,
+            max_rounds: Some(2),
+            on_peer_failure: PeerFailure::Continue,
+            current_round: 1,
+            current_speaker_idx: 1,
+            active: false,
+            closed: true,
+            history: vec![ChannelMessage {
+                from_job: "job_1".into(),
+                content: "draft".into(),
+                timestamp: SystemTime::now(),
+                round: 0,
+            }],
+            initial_message: Some("start".into()),
         }
     }
 
@@ -431,6 +544,22 @@ mod tests {
     }
 
     #[test]
+    fn test_persist_and_load_channel() {
+        let db = SqlitePersistence::new_memory().unwrap();
+        db.init_schema().unwrap();
+
+        let channel = make_test_channel();
+        db.persist_channel(&channel).unwrap();
+
+        let channels = db.load_channels().unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].channel_id, "run_1:debate");
+        assert!(channels[0].closed);
+        assert_eq!(channels[0].history.len(), 1);
+        assert_eq!(channels[0].initial_message.as_deref(), Some("start"));
+    }
+
+    #[test]
     fn test_upsert_updates_existing() {
         let db = SqlitePersistence::new_memory().unwrap();
         db.init_schema().unwrap();
@@ -479,6 +608,9 @@ mod tests {
         for artifact in db.load_artifacts().unwrap() {
             store.create_artifact(artifact);
         }
+        for channel in db.load_channels().unwrap() {
+            store.create_channel(channel);
+        }
 
         assert!(store.get_run("run_1").is_some());
         assert_eq!(store.list_run_jobs("run_1").len(), 2);
@@ -495,6 +627,7 @@ mod tests {
         store.create_run(make_test_run());
         store.create_job(make_test_job("job_1", "run_1"));
         store.create_job(make_test_job("job_2", "run_1"));
+        store.create_channel(make_test_channel());
 
         // Bulk persist
         db.persist_run_state(&store, "run_1").unwrap();
@@ -502,6 +635,7 @@ mod tests {
         // Verify
         assert_eq!(db.load_runs().unwrap().len(), 1);
         assert_eq!(db.load_jobs().unwrap().len(), 2);
+        assert_eq!(db.load_channels().unwrap().len(), 1);
     }
 
     #[test]
