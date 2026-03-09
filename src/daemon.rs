@@ -12,6 +12,73 @@ use crate::config::{self, Config};
 use crate::orchestrator::engine::OrchestratorEngine;
 use crate::server::{self, DaemonCommand, ManagedAgentRef, ResolvedGatewayConfig, SharedState};
 
+/// Activate channels whose participants are all running and send the initial
+/// message (if configured) to the first participant.  Expands in an async
+/// context that has mutable access to `$orchestrator` and `$managed`.
+macro_rules! activate_channels {
+    ($orchestrator:expr, $managed:expr) => {{
+        let activated_channels = $orchestrator.activate_ready_channels();
+        for ch_id in &activated_channels {
+            info!(channel_id = %ch_id, "channel activated — all participants running");
+            if let Some(ch) = $orchestrator.store.get_channel(ch_id) {
+                if let Some(ref initial_msg) = ch.initial_message {
+                    let first_job = ch.participants.first().cloned();
+                    if let Some(job_id) = first_job {
+                        let worker_name = format!("__job_{}", job_id);
+                        if let Some(internal) = $managed.get(&worker_name) {
+                            info!(channel = %ch_id, to = %job_id, "sending initial channel message");
+                            let _ = internal.handle.send_message(initial_msg.clone()).await;
+                        }
+                    }
+                }
+            }
+        }
+    }};
+}
+
+/// Handle channel peer failure for a given job: look up all channels the job
+/// participates in, then kill or notify peers according to the channel's
+/// failure policy.  Expands in an async context.
+macro_rules! handle_channel_peer_failures {
+    ($orchestrator:expr, $managed:expr, $job_id:expr) => {{
+        let failed_channels: Vec<String> = $orchestrator
+            .store
+            .channels_for_job(&$job_id)
+            .iter()
+            .map(|c| c.channel_id.clone())
+            .collect();
+        for ch_id in failed_channels {
+            let action = $orchestrator.handle_channel_peer_failure(&ch_id, &$job_id);
+            match action {
+                crate::orchestrator::types::ChannelAction::KillParticipants { job_ids } => {
+                    for kill_id in &job_ids {
+                        warn!(job_id = %kill_id, channel = %ch_id, "killing channel peer due to KillAll policy");
+                        let worker_name = format!("__job_{}", kill_id);
+                        if let Some(internal) = $managed.get(&worker_name) {
+                            internal.handle.stop().await;
+                        }
+                        $managed.remove(&worker_name);
+                        $orchestrator.mark_failed(
+                            kill_id,
+                            format!("channel peer '{}' failed (KillAll)", $job_id),
+                        );
+                    }
+                }
+                crate::orchestrator::types::ChannelAction::NotifyPeers { job_ids, message } => {
+                    for peer_id in &job_ids {
+                        info!(job_id = %peer_id, channel = %ch_id, "notifying peer of disconnection");
+                        let worker_name = format!("__job_{}", peer_id);
+                        if let Some(internal) = $managed.get(&worker_name) {
+                            let _ = internal.handle.send_message(message.clone()).await;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }};
+}
+
 /// Run the daemon. This is the main entry point.
 ///
 /// CLI sandbox flags override `daemon.isolation`; otherwise config decides whether
@@ -323,23 +390,7 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                   spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
                 }
 
-                // Activate channels where all participants are now Running
-                let activated_channels = orchestrator.activate_ready_channels();
-                for ch_id in &activated_channels {
-                    info!(channel_id = %ch_id, "channel activated — all participants running");
-                    if let Some(ch) = orchestrator.store.get_channel(ch_id) {
-                        if let Some(ref initial_msg) = ch.initial_message {
-                            let first_job = ch.participants.first().cloned();
-                            if let Some(job_id) = first_job {
-                                let worker_name = format!("__job_{}", job_id);
-                                if let Some(internal) = managed.get(&worker_name) {
-                                    info!(channel = %ch_id, to = %job_id, "sending initial channel message");
-                                    let _ = internal.handle.send_message(initial_msg.clone()).await;
-                                }
-                            }
-                        }
-                    }
-                }
+                activate_channels!(orchestrator, managed);
 
                 // Persist to SQLite
                 if let Some(ref db) = db {
@@ -493,23 +544,7 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                   spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
                 }
 
-                // Activate channels where all participants are now Running
-                let activated_channels = orchestrator.activate_ready_channels();
-                for ch_id in &activated_channels {
-                    info!(channel_id = %ch_id, "channel activated — all participants running");
-                    if let Some(ch) = orchestrator.store.get_channel(ch_id) {
-                        if let Some(ref initial_msg) = ch.initial_message {
-                            let first_job = ch.participants.first().cloned();
-                            if let Some(job_id) = first_job {
-                                let worker_name = format!("__job_{}", job_id);
-                                if let Some(internal) = managed.get(&worker_name) {
-                                    info!(channel = %ch_id, to = %job_id, "sending initial channel message");
-                                    let _ = internal.handle.send_message(initial_msg.clone()).await;
-                                }
-                            }
-                        }
-                    }
-                }
+                activate_channels!(orchestrator, managed);
 
                 // Persist run state to SQLite
                 if let Some(ref db) = db {
@@ -526,37 +561,8 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                 orchestrator.mark_failed(&job_id, error.to_string());
                 warn!(job_id = %job_id, error = %error, "job failed");
 
-                // Check if failed job was a channel participant
-                let failed_channels: Vec<String> = orchestrator.store.channels_for_job(&job_id)
-                    .iter()
-                    .map(|c| c.channel_id.clone())
-                    .collect();
-                for ch_id in failed_channels {
-                    let action = orchestrator.handle_channel_peer_failure(&ch_id, &job_id);
-                    match action {
-                        crate::orchestrator::types::ChannelAction::KillParticipants { job_ids } => {
-                            for kill_id in &job_ids {
-                                warn!(job_id = %kill_id, channel = %ch_id, "killing channel peer due to KillAll policy");
-                                let worker_name = format!("__job_{}", kill_id);
-                                if let Some(internal) = managed.get(&worker_name) {
-                                    internal.handle.stop().await;
-                                }
-                                managed.remove(&worker_name);
-                                orchestrator.mark_failed(kill_id, format!("channel peer '{}' failed (KillAll)", job_id));
-                            }
-                        }
-                        crate::orchestrator::types::ChannelAction::NotifyPeers { job_ids, message } => {
-                            for peer_id in &job_ids {
-                                info!(job_id = %peer_id, channel = %ch_id, "notifying peer of disconnection");
-                                let worker_name = format!("__job_{}", peer_id);
-                                if let Some(internal) = managed.get(&worker_name) {
-                                    let _ = internal.handle.send_message(message.clone()).await;
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                // Handle channel peer failure for the failed job
+                handle_channel_peer_failures!(orchestrator, managed, job_id);
 
                 // Spawn retry if re-queued
                 while let Some(job) = orchestrator.next_job() {
@@ -565,23 +571,7 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                   spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
                 }
 
-                // Activate channels where all participants are now Running
-                let activated_channels = orchestrator.activate_ready_channels();
-                for ch_id in &activated_channels {
-                    info!(channel_id = %ch_id, "channel activated — all participants running");
-                    if let Some(ch) = orchestrator.store.get_channel(ch_id) {
-                        if let Some(ref initial_msg) = ch.initial_message {
-                            let first_job = ch.participants.first().cloned();
-                            if let Some(job_id) = first_job {
-                                let worker_name = format!("__job_{}", job_id);
-                                if let Some(internal) = managed.get(&worker_name) {
-                                    info!(channel = %ch_id, to = %job_id, "sending initial channel message");
-                                    let _ = internal.handle.send_message(initial_msg.clone()).await;
-                                }
-                            }
-                        }
-                    }
-                }
+                activate_channels!(orchestrator, managed);
 
                 // Persist to SQLite
                 if let Some(ref db) = db {
@@ -666,37 +656,8 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
               managed.remove(&worker_name);
               orchestrator.mark_failed(&job_id, "heartbeat timeout".into());
 
-              // Check if failed job was a channel participant
-              let failed_channels: Vec<String> = orchestrator.store.channels_for_job(&job_id)
-                  .iter()
-                  .map(|c| c.channel_id.clone())
-                  .collect();
-              for ch_id in failed_channels {
-                  let action = orchestrator.handle_channel_peer_failure(&ch_id, &job_id);
-                  match action {
-                      crate::orchestrator::types::ChannelAction::KillParticipants { job_ids } => {
-                          for kill_id in &job_ids {
-                              warn!(job_id = %kill_id, channel = %ch_id, "killing channel peer due to KillAll policy");
-                              let worker_name = format!("__job_{}", kill_id);
-                              if let Some(internal) = managed.get(&worker_name) {
-                                  internal.handle.stop().await;
-                              }
-                              managed.remove(&worker_name);
-                              orchestrator.mark_failed(kill_id, format!("channel peer '{}' failed (KillAll)", job_id));
-                          }
-                      }
-                      crate::orchestrator::types::ChannelAction::NotifyPeers { job_ids, message } => {
-                          for peer_id in &job_ids {
-                              info!(job_id = %peer_id, channel = %ch_id, "notifying peer of disconnection");
-                              let worker_name = format!("__job_{}", peer_id);
-                              if let Some(internal) = managed.get(&worker_name) {
-                                  let _ = internal.handle.send_message(message.clone()).await;
-                              }
-                          }
-                      }
-                      _ => {}
-                  }
-              }
+              // Handle channel peer failure for the timed-out job
+              handle_channel_peer_failures!(orchestrator, managed, job_id);
 
               // Spawn retries if re-queued
               while let Some(job) = orchestrator.next_job() {
@@ -705,23 +666,7 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                 spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox_override).await;
               }
 
-              // Activate channels where all participants are now Running
-              let activated_channels = orchestrator.activate_ready_channels();
-              for ch_id in &activated_channels {
-                  info!(channel_id = %ch_id, "channel activated — all participants running");
-                  if let Some(ch) = orchestrator.store.get_channel(ch_id) {
-                      if let Some(ref initial_msg) = ch.initial_message {
-                          let first_job = ch.participants.first().cloned();
-                          if let Some(job_id) = first_job {
-                              let worker_name = format!("__job_{}", job_id);
-                              if let Some(internal) = managed.get(&worker_name) {
-                                  info!(channel = %ch_id, to = %job_id, "sending initial channel message");
-                                  let _ = internal.handle.send_message(initial_msg.clone()).await;
-                              }
-                          }
-                      }
-                  }
-              }
+              activate_channels!(orchestrator, managed);
 
               // Persist to SQLite
               if let Some(ref db) = db {
