@@ -37,6 +37,10 @@ enum Commands {
         /// Override server bind address
         #[arg(short, long)]
         bind: Option<String>,
+
+        /// Disable capsule isolation — run jobs as plain child processes
+        #[arg(long)]
+        no_sandbox: bool,
     },
     /// Show status of all running agents (queries daemon)
     Status,
@@ -199,7 +203,7 @@ async fn main() {
     }
 
     match cli.command {
-        Some(Commands::Daemon { bind }) => {
+        Some(Commands::Daemon { bind, no_sandbox }) => {
             // Load config to get log settings
             let config = zeptopm::config::load_config(&cli.config).unwrap_or_else(|e| {
                 eprintln!("Failed to load config: {}", e);
@@ -209,7 +213,8 @@ async fn main() {
             let log_level = cli.log_level.as_deref().unwrap_or(&config.daemon.log_level);
             init_tracing(log_level, &config.daemon.log_format);
 
-            zeptopm::daemon::run(cli.config, bind).await;
+            let sandbox = !no_sandbox;
+            zeptopm::daemon::run(cli.config, bind, sandbox).await;
         }
         Some(Commands::Status) => {
             let result: CliResult = match http_get(&cli.addr, "/status").await {
@@ -711,7 +716,7 @@ async fn main() {
             let log_level = cli.log_level.as_deref().unwrap_or(&config.daemon.log_level);
             init_tracing(log_level, &config.daemon.log_format);
 
-            zeptopm::daemon::run(cli.config, None).await;
+            zeptopm::daemon::run(cli.config, None, true).await;
         }
     }
 }

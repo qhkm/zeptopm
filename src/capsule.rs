@@ -68,6 +68,8 @@ pub fn capsule_spec_from_config(config: &crate::config::Config, job: &Job) -> Ca
         init_binary: namespace_init_binary(config),
         security,
         security_overrides,
+        firecracker: None,
+        fallback: None,
     }
 }
 
@@ -415,6 +417,10 @@ fn capsule_failure_event(
 }
 
 fn capsule_failure_message(report: &CapsuleReport) -> String {
+    if let Some(ref init_err) = report.init_error {
+        return format!("capsule init failed: {init_err}");
+    }
+
     if let Some(violation) = report.killed_by {
         return match violation {
             ResourceViolation::WallClock => "capsule killed by wall clock timeout".into(),

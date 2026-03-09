@@ -2,7 +2,8 @@
 //!
 //! Tests the full path: spawn_capsule_job → ZeptoKernel capsule → worker → events.
 //!
-//! Run with: cargo test --test capsule_integration
+//! Run with: cargo test --features capsule --test capsule_integration
+#![cfg(feature = "capsule")]
 
 use std::time::SystemTime;
 

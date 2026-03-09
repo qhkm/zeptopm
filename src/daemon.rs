@@ -13,7 +13,10 @@ use crate::orchestrator::engine::OrchestratorEngine;
 use crate::server::{self, DaemonCommand, ManagedAgentRef, ResolvedGatewayConfig, SharedState};
 
 /// Run the daemon. This is the main entry point.
-pub async fn run(config_path: String, bind: Option<String>) {
+///
+/// When `sandbox` is true (default), orchestrated jobs run inside ZeptoKernel capsules.
+/// Pass `--no-sandbox` to disable and spawn jobs as plain child processes.
+pub async fn run(config_path: String, bind: Option<String>, sandbox: bool) {
     let config = match config::load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -33,8 +36,14 @@ pub async fn run(config_path: String, bind: Option<String>) {
     info!(
         agents = config.agents.len(),
         poll_interval_ms = config.daemon.poll_interval_ms,
+        sandbox = sandbox,
         "zeptopm daemon starting"
     );
+
+    #[cfg(not(feature = "capsule"))]
+    if sandbox {
+        warn!("--sandbox requires zeptoPM built with 'capsule' feature (cargo build --features capsule) — running without isolation");
+    }
 
     let daemon_start = Instant::now();
     let (state_tx, mut state_rx) = mpsc::channel::<AgentStateUpdate>(256);
@@ -314,7 +323,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
                 while let Some(job) = orchestrator.next_job() {
                   info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
                   orchestrator.mark_running(&job.job_id);
-                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
+                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox).await;
                 }
 
                 // Persist to SQLite
@@ -466,7 +475,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
                 while let Some(job) = orchestrator.next_job() {
                   info!(job_id = %job.job_id, role = %job.role, "spawning job worker");
                   orchestrator.mark_running(&job.job_id);
-                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
+                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox).await;
                 }
 
                 // Persist run state to SQLite
@@ -488,7 +497,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
                 while let Some(job) = orchestrator.next_job() {
                   info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry)");
                   orchestrator.mark_running(&job.job_id);
-                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
+                  spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox).await;
                 }
 
                 // Persist to SQLite
@@ -551,7 +560,7 @@ pub async fn run(config_path: String, bind: Option<String>) {
               while let Some(job) = orchestrator.next_job() {
                 info!(job_id = %job.job_id, role = %job.role, "spawning job worker (retry after timeout)");
                 orchestrator.mark_running(&job.job_id);
-                spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store).await;
+                spawn_job_worker(&job, &config_path, &current_config, state_tx.clone(), orch_event_tx.clone(), &mut managed, &shared_state, &orchestrator.store, sandbox).await;
               }
 
               // Persist to SQLite
@@ -773,7 +782,9 @@ async fn apply_config_changes(
 }
 
 /// Spawn a temporary worker process for an orchestration job.
-/// When isolation = "capsule", uses ZeptoKernel capsule. Otherwise spawns bare child process.
+///
+/// When `sandbox` is true, uses ZeptoKernel capsule isolation.
+/// Otherwise spawns a bare child process.
 async fn spawn_job_worker(
     job: &crate::orchestrator::types::Job,
     config_path: &str,
@@ -783,12 +794,12 @@ async fn spawn_job_worker(
     _managed: &mut HashMap<String, InternalAgent>,
     _shared_state: &SharedState,
     orchestrator_store: &crate::orchestrator::store::RunStore,
+    sandbox: bool,
 ) {
-    // Capsule / process / namespace mode — delegate to ZeptoKernel
-    if matches!(
-        config.daemon.isolation.as_str(),
-        "capsule" | "process" | "namespace"
-    ) {
+    let _ = sandbox; // used only when `capsule` feature is enabled
+    // Sandbox mode — delegate to ZeptoKernel capsule
+    #[cfg(feature = "capsule")]
+    if sandbox {
         let (handle, join) =
             crate::capsule::spawn_capsule_job(job, config, orch_event_tx, orchestrator_store);
         let worker_name = format!("__job_{}", job.job_id);

@@ -1,4 +1,5 @@
 pub mod agent;
+#[cfg(feature = "capsule")]
 pub mod capsule;
 pub mod config;
 pub mod daemon;

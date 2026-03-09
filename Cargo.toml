@@ -26,4 +26,8 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 zeptoclaw = { path = "../zeptoclaw" }
-zeptokernel = { path = "../zeptokernel" }
+zeptokernel = { path = "../zeptokernel", optional = true }
+
+[features]
+default = ["capsule"]
+capsule = ["dep:zeptokernel"]
