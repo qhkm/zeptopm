@@ -825,6 +825,7 @@ mod tests {
             current_speaker_idx: 0,
             active: false,
             history: vec![],
+            initial_message: None,
         });
 
         let activated = engine.activate_ready_channels();
@@ -848,6 +849,7 @@ mod tests {
             current_speaker_idx: 0,
             active: true,
             history: vec![],
+            initial_message: None,
         };
         engine.store.create_channel(ch);
 
@@ -881,6 +883,7 @@ mod tests {
             current_speaker_idx: 0,
             active: true,
             history: vec![],
+            initial_message: None,
         };
         engine.store.create_channel(ch);
 
@@ -918,6 +921,7 @@ mod tests {
             current_speaker_idx: 0,
             active: true,
             history: vec![],
+            initial_message: None,
         };
         engine.store.create_channel(ch);
 
@@ -946,6 +950,7 @@ mod tests {
             current_speaker_idx: 0,
             active: true,
             history: vec![],
+            initial_message: None,
         };
         engine.store.create_channel(ch);
 
@@ -974,6 +979,7 @@ mod tests {
             current_speaker_idx: 0,
             active: true,
             history: vec![],
+            initial_message: None,
         };
         engine.store.create_channel(ch);
 
@@ -1050,6 +1056,7 @@ mod tests {
             current_speaker_idx: 0,
             active: false,
             history: vec![],
+            initial_message: None,
         });
 
         let activated = engine.activate_ready_channels();

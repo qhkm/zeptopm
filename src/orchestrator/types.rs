@@ -113,6 +113,7 @@ pub struct Channel {
     pub current_speaker_idx: usize,
     pub active: bool,
     pub history: Vec<ChannelMessage>,
+    pub initial_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

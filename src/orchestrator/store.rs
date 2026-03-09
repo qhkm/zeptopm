@@ -245,6 +245,7 @@ mod tests {
             current_speaker_idx: 0,
             active: false,
             history: vec![],
+            initial_message: None,
         };
         store.create_channel(channel);
         let got = store.get_channel("ch_1").unwrap();
@@ -266,6 +267,7 @@ mod tests {
             current_speaker_idx: 0,
             active: false,
             history: vec![],
+            initial_message: None,
         };
         store.create_channel(channel);
         let ch = store.get_channel_mut("ch_1").unwrap();
@@ -289,6 +291,7 @@ mod tests {
                 current_speaker_idx: 0,
                 active: false,
                 history: vec![],
+                initial_message: None,
             });
         }
         assert_eq!(store.list_run_channels("run_1").len(), 2);
@@ -309,6 +312,7 @@ mod tests {
             current_speaker_idx: 0,
             active: true,
             history: vec![],
+            initial_message: None,
         });
         store.create_channel(Channel {
             channel_id: "ch_2".into(),
@@ -321,6 +325,7 @@ mod tests {
             current_speaker_idx: 0,
             active: true,
             history: vec![],
+            initial_message: None,
         });
         let b_channels = store.channels_for_job("job_B");
         assert_eq!(b_channels.len(), 2);
@@ -343,6 +348,7 @@ mod tests {
             current_speaker_idx: 0,
             active: false,
             history: vec![],
+            initial_message: None,
         });
         store.remove_run("run_1");
         assert!(store.get_channel("ch_1").is_none());

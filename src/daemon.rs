@@ -327,6 +327,18 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                 let activated_channels = orchestrator.activate_ready_channels();
                 for ch_id in &activated_channels {
                     info!(channel_id = %ch_id, "channel activated — all participants running");
+                    if let Some(ch) = orchestrator.store.get_channel(ch_id) {
+                        if let Some(ref initial_msg) = ch.initial_message {
+                            let first_job = ch.participants.first().cloned();
+                            if let Some(job_id) = first_job {
+                                let worker_name = format!("__job_{}", job_id);
+                                if let Some(internal) = managed.get(&worker_name) {
+                                    info!(channel = %ch_id, to = %job_id, "sending initial channel message");
+                                    let _ = internal.handle.send_message(initial_msg.clone()).await;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Persist to SQLite
@@ -485,6 +497,18 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                 let activated_channels = orchestrator.activate_ready_channels();
                 for ch_id in &activated_channels {
                     info!(channel_id = %ch_id, "channel activated — all participants running");
+                    if let Some(ch) = orchestrator.store.get_channel(ch_id) {
+                        if let Some(ref initial_msg) = ch.initial_message {
+                            let first_job = ch.participants.first().cloned();
+                            if let Some(job_id) = first_job {
+                                let worker_name = format!("__job_{}", job_id);
+                                if let Some(internal) = managed.get(&worker_name) {
+                                    info!(channel = %ch_id, to = %job_id, "sending initial channel message");
+                                    let _ = internal.handle.send_message(initial_msg.clone()).await;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Persist run state to SQLite
@@ -545,12 +569,50 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
                 let activated_channels = orchestrator.activate_ready_channels();
                 for ch_id in &activated_channels {
                     info!(channel_id = %ch_id, "channel activated — all participants running");
+                    if let Some(ch) = orchestrator.store.get_channel(ch_id) {
+                        if let Some(ref initial_msg) = ch.initial_message {
+                            let first_job = ch.participants.first().cloned();
+                            if let Some(job_id) = first_job {
+                                let worker_name = format!("__job_{}", job_id);
+                                if let Some(internal) = managed.get(&worker_name) {
+                                    info!(channel = %ch_id, to = %job_id, "sending initial channel message");
+                                    let _ = internal.handle.send_message(initial_msg.clone()).await;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Persist to SQLite
                 if let Some(ref db) = db {
                   db.persist_run_state(&orchestrator.store, &run_id).ok();
                 }
+              }
+              "channel_message" => {
+                let channel_id = event.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
+                let from_job = event.get("from_job").and_then(|v| v.as_str()).unwrap_or("");
+                let content = event.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+                let action = orchestrator.route_channel_message(channel_id, from_job, content);
+                match action {
+                    crate::orchestrator::types::ChannelAction::SendTo { job_id, message } => {
+                        let worker_name = format!("__job_{}", job_id);
+                        if let Some(internal) = managed.get(&worker_name) {
+                            info!(channel = %channel_id, to = %job_id, "routing channel message");
+                            let _ = internal.handle.send_message(message).await;
+                        }
+                    }
+                    crate::orchestrator::types::ChannelAction::Close { channel_id } => {
+                        info!(channel = %channel_id, "channel closed — max rounds or done");
+                    }
+                    _ => {}
+                }
+              }
+              "channel_done" => {
+                let channel_id = event.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
+                let from_job = event.get("from_job").and_then(|v| v.as_str()).unwrap_or("");
+                let _action = orchestrator.handle_channel_done(channel_id, from_job);
+                info!(channel = %channel_id, from = %from_job, "channel_done signal received");
               }
               "artifact_produced" => {
                 let job_id = event.get("job_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -647,6 +709,18 @@ pub async fn run(config_path: String, bind: Option<String>, sandbox_override: Op
               let activated_channels = orchestrator.activate_ready_channels();
               for ch_id in &activated_channels {
                   info!(channel_id = %ch_id, "channel activated — all participants running");
+                  if let Some(ch) = orchestrator.store.get_channel(ch_id) {
+                      if let Some(ref initial_msg) = ch.initial_message {
+                          let first_job = ch.participants.first().cloned();
+                          if let Some(job_id) = first_job {
+                              let worker_name = format!("__job_{}", job_id);
+                              if let Some(internal) = managed.get(&worker_name) {
+                                  info!(channel = %ch_id, to = %job_id, "sending initial channel message");
+                                  let _ = internal.handle.send_message(initial_msg.clone()).await;
+                              }
+                          }
+                      }
+                  }
               }
 
               // Persist to SQLite

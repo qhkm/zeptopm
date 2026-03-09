@@ -161,6 +161,7 @@ pub fn materialize_plan(
             current_speaker_idx: 0,
             active: false,
             history: vec![],
+            initial_message: planned_ch.initial_message.clone(),
         };
         store.create_channel(channel);
     }
