@@ -526,6 +526,6 @@ cargo clippy
 
 [Apache 2.0](LICENSE)
 
-Made with ❤️ and 🦀 by [Kitakod Ventures](https://github.com/qhkm)
+Made with ❤️ and 🦀 by [Aisar Labs](https://github.com/qhkm)
 
 </div>
